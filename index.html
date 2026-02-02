@@ -1,0 +1,2192 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>A碼時效追蹤器</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap');
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { 
+      font-family: 'Noto Sans TC', 'Microsoft JhengHei', sans-serif;
+      background: linear-gradient(180deg, #0f172a 0%, #1e1b4b 100%);
+      min-height: 100vh;
+    }
+    input, button, select { font-family: inherit; }
+    input:focus, select:focus { outline: 2px solid #818cf8; }
+    select option { background: #1e293b; color: #e2e8f0; }
+    .btn { transition: all 0.15s; cursor: pointer; }
+    .btn:hover { transform: translateY(-1px); filter: brightness(1.1); }
+    .btn-advance { animation: pulse 2s infinite; }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(34,197,94,0.4); }
+      50% { box-shadow: 0 0 0 6px rgba(34,197,94,0); }
+    }
+    @keyframes urgent-blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    .urgent-blink { animation: urgent-blink 1s infinite; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useMemo } = React;
+
+    // ========== 工具家族標識 ==========
+    const TOOL_FAMILY = 'LTC_CARE_TOOLS';
+    const TOOL_VERSION = '52';
+    const TOOL_TYPE = 'AA_TRACKER';
+
+    // 台灣時區
+    const TW_TIMEZONE = 'Asia/Taipei';
+
+    // 金額常數
+    const AA01_PRICE = 1700;
+    const AA02_PRICE = 400;
+
+    // 出備階段最大月數（出院後4個月內需完成初評）
+    const DISCHARGE_MAX_MONTHS = 4;
+
+    // localStorage key（v3: startDate→originStartDate, earlyAA01→cycleBaseMonths）
+    const STORAGE_KEY = 'aa_management_v3';
+    const OLD_STORAGE_KEYS = ['aa_management_v2', 'aa_management_v1'];
+    const CARE_PLAN_KEYS = ['carePlanTimeline_v9', 'carePlanTimeline_v8', 'carePlanTimeline_v7'];
+
+    // ========== 額度分配相關 ==========
+    // phase: 'discharge' (出備階段) | 'main' (主階段)
+    // isNewCase: 是否為新案（出備=true, 1966初評=true, 出院準備初評後=false）
+    function getQuotaAllocationTargets(serviceMonth, isNewCase = true) {
+      // 新案的服務月1：開當月+次月額度
+      if (serviceMonth === 1 && isNewCase) {
+        return { targetMonths: [1, 2], isNewCase: true };
+      }
+      // 其他：開次月額度
+      return { targetMonths: [serviceMonth + 1], isNewCase: false };
+    }
+
+    function getQuotaStatus(quotaAllocations, serviceMonth, isNewCase = true) {
+      const targets = getQuotaAllocationTargets(serviceMonth, isNewCase);
+      const allocated = targets.targetMonths.every(tm => 
+        quotaAllocations.some(qa => qa.forServiceMonth === tm)
+      );
+      return { allocated, targets };
+    }
+
+    // ========== 時間工具函數 ==========
+    function getTaiwanNow() {
+      const now = new Date();
+      return new Date(now.toLocaleString('en-US', { timeZone: TW_TIMEZONE }));
+    }
+
+    function getTaiwanDateString() {
+      const now = getTaiwanNow();
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, '0');
+      const day = String(now.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    }
+
+    function getLastDayOfMonth(year, month) {
+      return new Date(year, month + 1, 0).getDate();
+    }
+
+    function getCurrentServiceMonth(startDate) {
+      const start = new Date(startDate + 'T00:00:00');
+      const now = getTaiwanNow();
+      const monthDiff = (now.getFullYear() - start.getFullYear()) * 12 + (now.getMonth() - start.getMonth());
+      return Math.max(1, monthDiff + 1);
+    }
+
+    // ========== AA01/AA02 週期判斷 ==========
+    // phase: 'discharge' (出備階段) | 'main' (主階段)
+    function getOriginalTaskType(serviceMonth, phase = 'main') {
+      // 出備階段：只有服務月1是AA01
+      if (phase === 'discharge') {
+        return serviceMonth === 1 ? 'AA01' : 'AA02';
+      }
+      
+      // 主階段（1966 和出院準備初評後相同）：
+      // 服務月 1 = 初評(AA01)
+      // 服務月 7, 13, 19... = AA01 ((serviceMonth - 1) % 6 === 0)
+      if (serviceMonth === 1) return 'AA01';
+      if ((serviceMonth - 1) % 6 === 0) return 'AA01';
+      return 'AA02';
+    }
+
+    // 主階段專用：支援基準月刷新（複評會重新定義 AA01/AA02 週期）
+    function getTaskType(serviceMonth, cycleBaseMonths = []) {
+      if (cycleBaseMonths.length === 0) {
+        return getOriginalTaskType(serviceMonth, 'main');
+      }
+      
+      // 找出比當前服務月早的最近一次複評（基準月刷新點）
+      const relevantBaseMonth = cycleBaseMonths
+        .filter(baseMonth => baseMonth < serviceMonth)
+        .sort((a, b) => b - a)[0];
+      
+      if (!relevantBaseMonth) {
+        // 沒有比當前早的複評，檢查當前月是否就是複評月
+        if (cycleBaseMonths.includes(serviceMonth)) {
+          return 'AA01';
+        }
+        return getOriginalTaskType(serviceMonth, 'main');
+      }
+      
+      // 以最近的複評為基準，計算當前月份的任務類型
+      const monthsSinceBase = serviceMonth - relevantBaseMonth;
+      if (monthsSinceBase % 6 === 0) {
+        return 'AA01';
+      }
+      return 'AA02';
+    }
+
+    function getDueDate(startDate, serviceMonth) {
+      const start = new Date(startDate + 'T00:00:00');
+      // 當月 = 第 1 個月，服務月 N = 起始月 + (N-1)
+      const monthOffset = serviceMonth - 1;
+      const targetYear = start.getFullYear() + Math.floor((start.getMonth() + monthOffset) / 12);
+      const targetMonth = (start.getMonth() + monthOffset) % 12;
+      const lastDay = getLastDayOfMonth(targetYear, targetMonth);
+      return `${targetYear}-${String(targetMonth + 1).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+    }
+
+    function getYearMonth(startDate, serviceMonth) {
+      const start = new Date(startDate + 'T00:00:00');
+      // 當月 = 第 1 個月，服務月 N = 起始月 + (N-1)
+      const monthOffset = serviceMonth - 1;
+      const targetYear = start.getFullYear() + Math.floor((start.getMonth() + monthOffset) / 12);
+      const targetMonth = (start.getMonth() + monthOffset) % 12;
+      return `${targetYear}-${String(targetMonth + 1).padStart(2, '0')}`;
+    }
+
+    function getStatYearMonth(startDate, serviceMonth, completedDate) {
+      // 服務月1用完成日期作為統計年月（因為初評/出備可能延後完成）
+      if (serviceMonth === 1) {
+        return completedDate.substring(0, 7);
+      } else {
+        return getYearMonth(startDate, serviceMonth);
+      }
+    }
+
+    function formatDate(dateStr) {
+      if (!dateStr) return '-';
+      const [y, m, d] = dateStr.split('-');
+      return `${m}/${d}`;
+    }
+
+    function formatYearMonth(ym) {
+      if (!ym) return '-';
+      const [y, m] = ym.split('-');
+      return `${y}/${m}`;
+    }
+
+    // ========== 待辦任務計算 ==========
+    
+    // 出備階段待辦計算
+    function getDischargeTasks(discharge, startDate) {
+      if (!discharge || !discharge.startDate) return [];
+      
+      const today = getTaiwanDateString();
+      const currentSM = getCurrentServiceMonth(discharge.startDate);
+      const completions = discharge.completions || [];
+      const quotaAllocations = discharge.quotaAllocations || [];
+      const tasks = [];
+      
+      // 出備階段最多4個月
+      const maxSM = Math.min(currentSM, DISCHARGE_MAX_MONTHS);
+      
+      for (let sm = 1; sm <= maxSM; sm++) {
+        const taskType = getOriginalTaskType(sm, 'discharge');
+        const dueDate = getDueDate(discharge.startDate, sm);
+        const yearMonth = getYearMonth(discharge.startDate, sm);
+        const completion = completions.find(c => c.serviceMonth === sm);
+        const isOverdue = today > dueDate;
+        const isCurrentMonth = yearMonth === today.substring(0, 7);
+        
+        // AA01/AA02 任務
+        if (!completion && (isCurrentMonth || isOverdue)) {
+          tasks.push({
+            phase: 'discharge',
+            type: taskType,
+            serviceMonth: sm,
+            yearMonth,
+            dueDate,
+            isOverdue,
+            daysOverdue: isOverdue ? Math.floor((new Date(today) - new Date(dueDate)) / 86400000) : 0,
+          });
+        }
+        
+        // 額度分配任務（出備是新案）
+        if (isCurrentMonth && !isOverdue) {
+          const quotaStatus = getQuotaStatus(quotaAllocations, sm, true);
+          if (!quotaStatus.allocated) {
+            const allocatedMonths = quotaAllocations.map(qa => qa.forServiceMonth);
+            const pendingTargetMonths = quotaStatus.targets.targetMonths.filter(tm => !allocatedMonths.includes(tm));
+            if (pendingTargetMonths.length > 0) {
+              tasks.push({
+                phase: 'discharge',
+                type: 'QUOTA',
+                serviceMonth: sm,
+                yearMonth,
+                quotaTargetMonths: pendingTargetMonths,
+                quotaTargetYearMonths: pendingTargetMonths.map(tm => getYearMonth(discharge.startDate, tm)),
+                isNewCase: quotaStatus.targets.isNewCase,
+              });
+            }
+          }
+        }
+      }
+      
+      // 當月完成AA01/AA02後，檢查額度待辦
+      const currentMonthCompletion = completions.find(c => c.serviceMonth === currentSM);
+      if (currentMonthCompletion && currentSM <= DISCHARGE_MAX_MONTHS) {
+        const quotaStatus = getQuotaStatus(quotaAllocations, currentSM, true);
+        if (!quotaStatus.allocated) {
+          const alreadyHasQuota = tasks.find(t => t.phase === 'discharge' && t.type === 'QUOTA' && t.serviceMonth === currentSM);
+          if (!alreadyHasQuota) {
+            const allocatedMonths = quotaAllocations.map(qa => qa.forServiceMonth);
+            const pendingTargetMonths = quotaStatus.targets.targetMonths.filter(tm => !allocatedMonths.includes(tm));
+            if (pendingTargetMonths.length > 0) {
+              tasks.push({
+                phase: 'discharge',
+                type: 'QUOTA',
+                serviceMonth: currentSM,
+                yearMonth: getYearMonth(discharge.startDate, currentSM),
+                quotaTargetMonths: pendingTargetMonths,
+                quotaTargetYearMonths: pendingTargetMonths.map(tm => getYearMonth(discharge.startDate, tm)),
+                isNewCase: quotaStatus.targets.isNewCase,
+              });
+            }
+          }
+        }
+      }
+      
+      return tasks;
+    }
+    
+    // 主階段待辦計算
+    function getMainTasks(caseData) {
+      if (!caseData.originStartDate) return [];
+      
+      const today = getTaiwanDateString();
+      const currentSM = getCurrentServiceMonth(caseData.originStartDate);
+      const cycleBaseMonths = caseData.cycleBaseMonths || [];
+      const completions = caseData.completions || [];
+      const quotaAllocations = caseData.quotaAllocations || [];
+      // 出院準備初評後 isNewCase = false（系統已有出備紀錄）
+      // 1966 isNewCase = true（第一週期）或 false（複評週期）
+      const isNewCase = caseData.sourceType === 'pac' ? false : (caseData.isFirstCycle !== false);
+      const tasks = [];
+      
+      for (let sm = 1; sm <= currentSM; sm++) {
+        const taskType = getTaskType(sm, cycleBaseMonths);
+        const dueDate = getDueDate(caseData.originStartDate, sm);
+        const yearMonth = getYearMonth(caseData.originStartDate, sm);
+        const completion = completions.find(c => c.serviceMonth === sm);
+        const isOverdue = today > dueDate;
+        const isCurrentMonth = yearMonth === today.substring(0, 7);
+        
+        // AA01/AA02 任務
+        if (!completion && (isCurrentMonth || isOverdue)) {
+          tasks.push({
+            phase: 'main',
+            type: taskType,
+            serviceMonth: sm,
+            yearMonth,
+            dueDate,
+            isOverdue,
+            daysOverdue: isOverdue ? Math.floor((new Date(today) - new Date(dueDate)) / 86400000) : 0,
+          });
+        }
+        
+        // 額度分配任務
+        if (isCurrentMonth && !isOverdue) {
+          const quotaStatus = getQuotaStatus(quotaAllocations, sm, isNewCase);
+          if (!quotaStatus.allocated) {
+            const allocatedMonths = quotaAllocations.map(qa => qa.forServiceMonth);
+            const pendingTargetMonths = quotaStatus.targets.targetMonths.filter(tm => !allocatedMonths.includes(tm));
+            if (pendingTargetMonths.length > 0) {
+              tasks.push({
+                phase: 'main',
+                type: 'QUOTA',
+                serviceMonth: sm,
+                yearMonth,
+                quotaTargetMonths: pendingTargetMonths,
+                quotaTargetYearMonths: pendingTargetMonths.map(tm => getYearMonth(caseData.originStartDate, tm)),
+                isNewCase: quotaStatus.targets.isNewCase,
+              });
+            }
+          }
+        }
+      }
+      
+      // （v52 移除自動提前提醒：改為每個 AA02 待辦都可手動「提前」為 AA01）
+      
+      // 當月完成後，檢查額度待辦
+      const currentMonthCompletion = completions.find(c => c.serviceMonth === currentSM);
+      if (currentMonthCompletion) {
+        const quotaStatus = getQuotaStatus(quotaAllocations, currentSM, isNewCase);
+        if (!quotaStatus.allocated) {
+          const alreadyHasQuota = tasks.find(t => t.phase === 'main' && t.type === 'QUOTA' && t.serviceMonth === currentSM);
+          if (!alreadyHasQuota) {
+            const allocatedMonths = quotaAllocations.map(qa => qa.forServiceMonth);
+            const pendingTargetMonths = quotaStatus.targets.targetMonths.filter(tm => !allocatedMonths.includes(tm));
+            if (pendingTargetMonths.length > 0) {
+              tasks.push({
+                phase: 'main',
+                type: 'QUOTA',
+                serviceMonth: currentSM,
+                yearMonth: getYearMonth(caseData.originStartDate, currentSM),
+                quotaTargetMonths: pendingTargetMonths,
+                quotaTargetYearMonths: pendingTargetMonths.map(tm => getYearMonth(caseData.originStartDate, tm)),
+                isNewCase: quotaStatus.targets.isNewCase,
+              });
+            }
+          }
+        }
+      }
+      
+      return tasks;
+    }
+    
+    // 整合待辦（出備 + 主階段）
+    function getPendingTasks(caseData) {
+      const dischargeTasks = caseData.sourceType === 'pac' ? getDischargeTasks(caseData.discharge, caseData.originStartDate) : [];
+      const mainTasks = caseData.originStartDate ? getMainTasks(caseData) : [];
+      return [...dischargeTasks, ...mainTasks];
+    }
+
+    // 主階段下次AA01資訊（與照顧計畫時效追蹤器完全對稱）
+    function getNextAA01Info(caseData) {
+      if (!caseData.originStartDate) return null;
+      
+      const completions = caseData.completions || [];
+      
+      // 使用 cycleStartDate + cycleStartServiceMonth 計算年月（與照顧計畫完全一致）
+      const cycleStartDate = caseData.cycleStartDate;
+      const cycleStartSM = caseData.cycleStartServiceMonth;
+      
+      if (cycleStartDate && cycleStartSM) {
+        const start = new Date(cycleStartDate + 'T00:00:00');
+        
+        // 計算年月的函數（與照顧計畫 calcYM 完全相同，但返回 - 分隔格式）
+        const calcYM = (sm) => {
+          const mo = sm - cycleStartSM;
+          const y = start.getFullYear() + Math.floor((start.getMonth() + mo) / 12);
+          const m = (start.getMonth() + mo) % 12;
+          return `${y}-${String(m + 1).padStart(2, '0')}`;  // 用 - 分隔
+        };
+        
+        // 從 sourceCurrentServiceMonth（照顧計畫的 currentServiceMonth）開始計算下一個 AA01
+        const currentSM = caseData.sourceCurrentServiceMonth || cycleStartSM;
+        
+        // 使用照顧計畫的 getNextRoundServiceMonth 邏輯
+        // 下一個服務月 = 當前服務月 + 6（簡化版，不考慮複評週期）
+        let nextSM = currentSM + 6;
+        
+        // 如果下一個服務月是複評（(sm-1) % 12 === 0），再加 6 到 AA01
+        const reviewCycle = 12;
+        if ((nextSM - 1) % reviewCycle === 0) {
+          nextSM += 6;
+        }
+        
+        // 檢查是否已完成
+        const isCompleted = completions.some(c => 
+          c.serviceMonth === nextSM || c.absoluteServiceMonth === nextSM
+        );
+        
+        if (!isCompleted) {
+          return {
+            serviceMonth: nextSM,
+            yearMonth: calcYM(nextSM),
+            dueDate: getDueDate(caseData.originStartDate, nextSM),
+          };
+        }
+        
+        // 如果已完成，繼續找下一個
+        for (let offset = 12; offset <= 24; offset += 6) {
+          const sm = currentSM + offset;
+          if ((sm - 1) % reviewCycle === 0) continue;  // 跳過複評
+          const done = completions.some(c => 
+            c.serviceMonth === sm || c.absoluteServiceMonth === sm
+          );
+          if (!done) {
+            return {
+              serviceMonth: sm,
+              yearMonth: calcYM(sm),
+              dueDate: getDueDate(caseData.originStartDate, sm),
+            };
+          }
+        }
+        
+        return null;
+      }
+      
+      // fallback：舊版資料沒有 cycleStartDate，使用原有邏輯
+      const currentSM = getCurrentServiceMonth(caseData.originStartDate);
+      const cycleBaseMonths = caseData.cycleBaseMonths || [];
+      
+      for (let sm = currentSM; sm <= currentSM + 12; sm++) {
+        const taskType = getTaskType(sm, cycleBaseMonths);
+        if (taskType === 'AA01') {
+          const completion = completions.find(c => c.serviceMonth === sm);
+          if (!completion) {
+            return {
+              serviceMonth: sm,
+              yearMonth: getYearMonth(caseData.originStartDate, sm),
+              dueDate: getDueDate(caseData.originStartDate, sm),
+            };
+          }
+        }
+      }
+      return null;
+    }
+
+    // ========== 從照顧計畫匯入 ==========
+    
+    // 出備階段自動補登
+    function generateDischargeAutoCompletions(dischargeDate, maxServiceMonth) {
+      const completions = [];
+      const quotaAllocations = [];
+      
+      for (let sm = 1; sm < maxServiceMonth; sm++) {
+        const taskType = getOriginalTaskType(sm, 'discharge');
+        const completedDate = getDueDate(dischargeDate, sm);
+        completions.push({
+          serviceMonth: sm,
+          type: taskType,
+          completedDate,
+          autoImported: true,
+        });
+        
+        // 出備是新案
+        const targets = getQuotaAllocationTargets(sm, true);
+        targets.targetMonths.forEach(tm => {
+          if (!quotaAllocations.some(qa => qa.forServiceMonth === tm)) {
+            quotaAllocations.push({
+              forServiceMonth: tm,
+              forYearMonth: getYearMonth(dischargeDate, tm),
+              allocatedInServiceMonth: sm,
+              allocatedDate: completedDate,
+              autoImported: true,
+            });
+          }
+        });
+      }
+      
+      return { completions, quotaAllocations };
+    }
+    
+    // 主階段自動補登（支援基準月刷新 + history 記錄）
+    // 只補登過去月份，當月不自動完成（避免未完成就被標記）
+    function generateMainAutoCompletions(startDate, isNewCase = true, cycleBaseMonths = [], historyAA01Records = []) {
+      const completions = [];
+      const quotaAllocations = [];
+      const currentSM = getCurrentServiceMonth(startDate);
+      
+      // 建立 history 中已完成 AA01 的服務月 Map
+      const historyAA01Map = new Map(historyAA01Records.map(r => [r.serviceMonth, r]));
+
+      // 只補登過去月份（不含當月）
+      for (let sm = 1; sm < currentSM; sm++) {
+        // 如果這個月在 history 中有 AA01 記錄（初評/AA01家訪/複評），直接使用
+        const historyRecord = historyAA01Map.get(sm);
+        if (historyRecord) {
+          completions.push({
+            serviceMonth: sm,
+            type: 'AA01',
+            completedDate: historyRecord.completedDate || getDueDate(startDate, sm),
+            autoImported: true,
+            fromHistory: true,
+          });
+          
+          // 額度分配
+          const targets = getQuotaAllocationTargets(sm, isNewCase);
+          targets.targetMonths.forEach(tm => {
+            if (!quotaAllocations.some(qa => qa.forServiceMonth === tm)) {
+              quotaAllocations.push({
+                forServiceMonth: tm,
+                forYearMonth: getYearMonth(startDate, tm),
+                allocatedInServiceMonth: sm,
+                allocatedDate: historyRecord.completedDate || getDueDate(startDate, sm),
+                autoImported: true,
+              });
+            }
+          });
+          continue;
+        }
+        
+        // 非 history 記錄的過去月份，補登 AA01/AA02
+        const taskType = getTaskType(sm, cycleBaseMonths);
+        const completedDate = getDueDate(startDate, sm);
+        completions.push({
+          serviceMonth: sm,
+          type: taskType,
+          completedDate,
+          autoImported: true,
+        });
+        
+        const targets = getQuotaAllocationTargets(sm, isNewCase);
+        targets.targetMonths.forEach(tm => {
+          if (!quotaAllocations.some(qa => qa.forServiceMonth === tm)) {
+            quotaAllocations.push({
+              forServiceMonth: tm,
+              forYearMonth: getYearMonth(startDate, tm),
+              allocatedInServiceMonth: sm,
+              allocatedDate: completedDate,
+              autoImported: true,
+            });
+          }
+        });
+      }
+      
+      return { completions, quotaAllocations };
+    }
+
+    // 從日期計算絕對服務月（與照顧計畫時效追蹤器統一命名）
+    function calculateAbsoluteServiceMonth(originDate, targetDate) {
+      if (!originDate || !targetDate) return null;
+      const origin = new Date(originDate + 'T00:00:00');
+      const target = new Date(targetDate + 'T00:00:00');
+      const monthDiff = (target.getFullYear() - origin.getFullYear()) * 12 
+                      + (target.getMonth() - origin.getMonth());
+      return Math.max(1, monthDiff + 1);
+    }
+
+    function convertCarePlanToAACase(carePlan, currentDate) {
+      const sourceType = carePlan.sourceType || '1966';
+      const currentServiceMonth = carePlan.currentServiceMonth ?? (sourceType === 'pac' ? 1 : 1);
+      const history = carePlan.history || [];
+      
+      // 判斷是否為第一個週期（1966 用）
+      const hasInitialRecord = history.some(h => h.type === 'initial');
+      const isFirstCycle = !hasInitialRecord;
+      
+      // 判斷出院準備的階段
+      const isPAC = sourceType === 'pac';
+      const isDischargePhase = isPAC && !carePlan.cmApprovalDate && !carePlan.cycleStartDate;
+      
+      // 取得起算日：優先用 originStartDate（新版），fallback 到 cycleStartDate 或 cmApprovalDate
+      const getMainStartDate = () => {
+        return carePlan.originStartDate || carePlan.cycleStartDate || carePlan.cmApprovalDate;
+      };
+      
+      // ===== 1966 案源 =====
+      if (!isPAC) {
+        const mainStartDate = getMainStartDate();
+        if (!mainStartDate) return null;
+        
+        // 從 history 中提取所有 AA01 類型的完成記錄
+        const historyAA01Records = [];
+        const cycleBaseMonths = [];
+        
+        history.forEach(h => {
+          if (['initial', 'aa01', 'review'].includes(h.type)) {
+            // 優先使用 absoluteServiceMonth（新版格式），否則用日期計算（舊版兼容）
+            let absoluteSM = h.absoluteServiceMonth;
+            if (!absoluteSM) {
+              const actualDate = h.dates?.cmApprovalDate || h.completedDate;
+              if (actualDate) {
+                absoluteSM = calculateAbsoluteServiceMonth(mainStartDate, actualDate);
+              }
+            }
+            
+            const completedDate = h.dates?.cmApprovalDate || h.completedDate;
+            if (absoluteSM && completedDate) {
+              historyAA01Records.push({
+                serviceMonth: absoluteSM,
+                type: 'AA01',
+                completedDate: completedDate,
+              });
+              // 複評是基準月刷新點
+              if (h.type === 'review') {
+                cycleBaseMonths.push(absoluteSM);
+              }
+            }
+          }
+        });
+        
+        // 當前輪次處理
+        if (carePlan.cmApprovalDate) {
+          // 優先使用 absoluteServiceMonth（新版），否則計算
+          let currentAbsoluteSM = carePlan.absoluteServiceMonth;
+          if (!currentAbsoluteSM) {
+            currentAbsoluteSM = getCurrentServiceMonth(mainStartDate);
+          }
+          
+          // 檢查當前輪次是否已在 historyAA01Records 中
+          if (!historyAA01Records.some(r => r.serviceMonth === currentAbsoluteSM)) {
+            // 判斷當前輪次是否為 AA01 類型（初評/AA01/複評）
+            const isAA01Type = carePlan.currentServiceMonth === 1 ||
+              (carePlan.currentServiceMonth - 1) % 12 === 0 ||
+              (carePlan.currentServiceMonth - 1) % 6 === 0;
+            
+            if (isAA01Type) {
+              historyAA01Records.push({
+                serviceMonth: currentAbsoluteSM,
+                type: 'AA01',
+                completedDate: carePlan.cmApprovalDate,
+              });
+              // 如果是複評（相對服務月 % 12 === 0），加入基準月刷新
+              if ((carePlan.currentServiceMonth - 1) % 12 === 0 && carePlan.currentServiceMonth > 1) {
+                cycleBaseMonths.push(currentAbsoluteSM);
+              }
+            }
+          }
+        }
+        
+        cycleBaseMonths.sort((a, b) => a - b);
+        
+        const { completions, quotaAllocations } = generateMainAutoCompletions(
+          mainStartDate, isFirstCycle, cycleBaseMonths, historyAA01Records
+        );
+        
+        return {
+          id: Date.now() + Math.random(),
+          caseName: carePlan.caseName,
+          caseNumber: carePlan.caseNumber || '',
+          sourceType: '1966',
+          originStartDate: mainStartDate,
+          // 新增：與照顧計畫時效追蹤器對稱的字段
+          cycleStartDate: carePlan.cycleStartDate || mainStartDate,
+          cycleStartServiceMonth: carePlan.cycleStartServiceMonth || 1,
+          sourceCurrentServiceMonth: carePlan.currentServiceMonth || 1,
+          completions,
+          quotaAllocations,
+          cycleBaseMonths: cycleBaseMonths,
+          isFirstCycle,
+          discharge: null,
+          importedFrom: 'carePlanTracker',
+          importedAt: currentDate,
+          sourcePlanId: carePlan.id,
+        };
+      }
+      
+      // ===== 出院準備案源 - 出備階段 =====
+      if (isDischargePhase) {
+        if (!carePlan.dischargeDate) return null;
+        
+        const dischargeSM = getCurrentServiceMonth(carePlan.dischargeDate);
+        const { completions: dischargeCompletions, quotaAllocations: dischargeQuotas } = 
+          generateDischargeAutoCompletions(carePlan.dischargeDate, Math.min(dischargeSM, DISCHARGE_MAX_MONTHS + 1));
+        
+        return {
+          id: Date.now() + Math.random(),
+          caseName: carePlan.caseName,
+          caseNumber: carePlan.caseNumber || '',
+          sourceType: 'pac',
+          originStartDate: null,
+          completions: [],
+          quotaAllocations: [],
+          cycleBaseMonths: [],
+          isFirstCycle: false,
+          discharge: {
+            startDate: carePlan.dischargeDate,  // 出備起算日保持原名
+            completions: dischargeCompletions,
+            quotaAllocations: dischargeQuotas,
+          },
+          importedFrom: 'carePlanTracker',
+          importedAt: currentDate,
+          sourcePlanId: carePlan.id,
+          sourceServiceMonth: currentServiceMonth,
+        };
+      }
+      
+      // ===== 出院準備案源 - 初評後 =====
+      const mainStartDate = carePlan.originStartDate || carePlan.cycleStartDate || carePlan.cmApprovalDate;
+      if (!mainStartDate) return null;
+      
+      // 從 history 中提取所有 AA01 類型的完成記錄
+      const historyAA01Records = [];
+      const cycleBaseMonths = [];
+      
+      history.forEach(h => {
+        if (['initial', 'aa01', 'review'].includes(h.type)) {
+          // 優先使用 absoluteServiceMonth（新版格式），否則用日期計算（舊版兼容）
+          let absoluteSM = h.absoluteServiceMonth;
+          if (!absoluteSM) {
+            const actualDate = h.dates?.cmApprovalDate || h.completedDate;
+            if (actualDate) {
+              absoluteSM = calculateAbsoluteServiceMonth(mainStartDate, actualDate);
+            }
+          }
+          
+          const completedDate = h.dates?.cmApprovalDate || h.completedDate;
+          if (absoluteSM && completedDate) {
+            historyAA01Records.push({
+              serviceMonth: absoluteSM,
+              type: 'AA01',
+              completedDate: completedDate,
+            });
+            if (h.type === 'review') {
+              cycleBaseMonths.push(absoluteSM);
+            }
+          }
+        }
+      });
+      
+      // 當前輪次處理
+      if (carePlan.cmApprovalDate) {
+        // 優先使用 absoluteServiceMonth（新版），否則計算
+        let currentAbsoluteSM = carePlan.absoluteServiceMonth;
+        if (!currentAbsoluteSM) {
+          currentAbsoluteSM = getCurrentServiceMonth(mainStartDate);
+        }
+        
+        if (!historyAA01Records.some(r => r.serviceMonth === currentAbsoluteSM)) {
+          // 判斷當前輪次是否為 AA01 類型
+          const isAA01Type = carePlan.currentServiceMonth === 1 ||
+            (carePlan.currentServiceMonth - 1) % 12 === 0 ||
+            (carePlan.currentServiceMonth - 1) % 6 === 0;
+          
+          if (isAA01Type) {
+            historyAA01Records.push({
+              serviceMonth: currentAbsoluteSM,
+              type: 'AA01',
+              completedDate: carePlan.cmApprovalDate,
+            });
+            if ((carePlan.currentServiceMonth - 1) % 12 === 0 && carePlan.currentServiceMonth > 1) {
+              cycleBaseMonths.push(currentAbsoluteSM);
+            }
+          }
+        }
+      }
+      
+      cycleBaseMonths.sort((a, b) => a - b);
+      
+      const { completions: mainCompletions, quotaAllocations: mainQuotas } = 
+        generateMainAutoCompletions(mainStartDate, false, cycleBaseMonths, historyAA01Records);
+      
+      // 出備階段
+      let discharge = null;
+      if (carePlan.dischargeDate) {
+        discharge = {
+          startDate: carePlan.dischargeDate,
+          completions: [],
+          quotaAllocations: [],
+        };
+        for (let sm = 1; sm <= DISCHARGE_MAX_MONTHS; sm++) {
+          const taskType = getOriginalTaskType(sm, 'discharge');
+          const completedDate = getDueDate(carePlan.dischargeDate, sm);
+          discharge.completions.push({
+            serviceMonth: sm,
+            type: taskType,
+            completedDate,
+            autoImported: true,
+          });
+          
+          const targets = getQuotaAllocationTargets(sm, true);
+          targets.targetMonths.forEach(tm => {
+            if (!discharge.quotaAllocations.some(qa => qa.forServiceMonth === tm)) {
+              discharge.quotaAllocations.push({
+                forServiceMonth: tm,
+                forYearMonth: getYearMonth(carePlan.dischargeDate, tm),
+                allocatedInServiceMonth: sm,
+                allocatedDate: completedDate,
+                autoImported: true,
+              });
+            }
+          });
+        }
+      }
+      
+      return {
+        id: Date.now() + Math.random(),
+        caseName: carePlan.caseName,
+        caseNumber: carePlan.caseNumber || '',
+        sourceType: 'pac',
+        originStartDate: mainStartDate,
+        // 新增：與照顧計畫時效追蹤器對稱的字段
+        cycleStartDate: carePlan.cycleStartDate || mainStartDate,
+        cycleStartServiceMonth: carePlan.cycleStartServiceMonth || 1,
+        sourceCurrentServiceMonth: carePlan.currentServiceMonth || 1,
+        completions: mainCompletions,
+        quotaAllocations: mainQuotas,
+        cycleBaseMonths: cycleBaseMonths,
+        isFirstCycle: false,
+        discharge,
+        importedFrom: 'carePlanTracker',
+        importedAt: currentDate,
+        sourcePlanId: carePlan.id,
+        sourceServiceMonth: currentServiceMonth,
+      };
+    }
+
+    // ========== 資料遷移 ==========
+    function migrateData(oldCases) {
+      // 嘗試讀取照顧計畫資料來補充 cycleBaseMonths
+      let carePlans = [];
+      for (const key of CARE_PLAN_KEYS) {
+        const data = localStorage.getItem(key);
+        if (data) {
+          try { carePlans = JSON.parse(data); break; } catch (e) {}
+        }
+      }
+      
+      // 建立照顧計畫的快速查找 Map（by sourcePlanId 或 caseName+originStartDate）
+      const carePlanMap = new Map();
+      carePlans.forEach(plan => {
+        if (plan.id) carePlanMap.set(`id:${plan.id}`, plan);
+        if (plan.caseName && plan.cmApprovalDate) {
+          carePlanMap.set(`name:${plan.caseName}|${plan.cmApprovalDate}`, plan);
+        }
+        if (plan.caseName && plan.cycleStartDate) {
+          carePlanMap.set(`name:${plan.caseName}|${plan.cycleStartDate}`, plan);
+        }
+      });
+      
+      return oldCases.map(c => {
+        // ===== 欄位名映射（v2→v3）=====
+        // startDate → originStartDate
+        // earlyAA01 → cycleBaseMonths
+        const migrated = {
+          ...c,
+          sourceType: c.sourceType || '1966',
+          // 舊版欄位名映射
+          originStartDate: c.originStartDate || c.startDate || null,
+          // 新增：與照顧計畫對稱的字段
+          cycleStartDate: c.cycleStartDate || null,
+          cycleStartServiceMonth: c.cycleStartServiceMonth || null,
+          sourceCurrentServiceMonth: c.sourceCurrentServiceMonth || null,
+          cycleBaseMonths: c.cycleBaseMonths || c.earlyAA01 || [],
+          quotaAllocations: c.quotaAllocations || [],
+          completions: c.completions || [],
+          isFirstCycle: c.isFirstCycle !== undefined ? c.isFirstCycle : true,
+        };
+        
+        // 移除舊欄位名（避免混淆）
+        delete migrated.startDate;
+        delete migrated.earlyAA01;
+        
+        // 出院準備案源：確保有 discharge 結構
+        if (migrated.sourceType === 'pac' && !migrated.discharge) {
+          if (c.sourceServiceMonth === 0) {
+            migrated.discharge = {
+              startDate: migrated.originStartDate,  // discharge.startDate 保持原名
+              completions: migrated.completions,
+              quotaAllocations: migrated.quotaAllocations,
+            };
+            migrated.originStartDate = null;
+            migrated.completions = [];
+            migrated.quotaAllocations = [];
+          } else {
+            migrated.discharge = null;
+          }
+        }
+        
+        // 出院準備初評後 isFirstCycle 永遠是 false
+        if (migrated.sourceType === 'pac' && migrated.originStartDate) {
+          migrated.isFirstCycle = false;
+        }
+        
+        // ===== 自動從照顧計畫補充 cycleBaseMonths 和當月完成記錄 =====
+        let matchedPlan = null;
+        if (c.sourcePlanId) {
+          matchedPlan = carePlanMap.get(`id:${c.sourcePlanId}`);
+        }
+        // 嘗試用舊版欄位名或新版欄位名匹配
+        const matchKey = c.originStartDate || c.startDate;
+        if (!matchedPlan && c.caseName && matchKey) {
+          matchedPlan = carePlanMap.get(`name:${c.caseName}|${matchKey}`);
+        }
+        
+        if (matchedPlan) {
+          const history = matchedPlan.history || [];
+          
+          // 從 history 提取複評的絕對服務月作為基準月刷新點
+          const mainStartDate = matchedPlan.originStartDate || matchedPlan.cycleStartDate || matchedPlan.cmApprovalDate || migrated.originStartDate;
+          const newCycleBaseMonths = [];
+          const historyAA01Records = [];
+          
+          history.forEach(h => {
+            if (['initial', 'aa01', 'review'].includes(h.type)) {
+              // 優先使用 absoluteServiceMonth（新版），否則用日期計算
+              let absoluteSM = h.absoluteServiceMonth;
+              if (!absoluteSM && mainStartDate) {
+                const dateForCalc = h.dates?.supervisorApprovalDate || h.dates?.cmApprovalDate || h.completedDate;
+                if (dateForCalc) {
+                  absoluteSM = calculateAbsoluteServiceMonth(mainStartDate, dateForCalc);
+                }
+              }
+              
+              if (absoluteSM) {
+                historyAA01Records.push({
+                  serviceMonth: absoluteSM,
+                  completedDate: h.dates?.cmApprovalDate || h.completedDate || null,
+                });
+                if (h.type === 'review') {
+                  newCycleBaseMonths.push(absoluteSM);
+                }
+              }
+            }
+          });
+          
+          // 如果當前輪次是 AA01 類型且已完成照專簽審
+          const currentRoundType = matchedPlan.currentServiceMonth ? 
+            (matchedPlan.currentServiceMonth === 1 ? 'initial' : 
+             ((matchedPlan.currentServiceMonth - 1) % 12 === 0 ? 'review' : 
+              ((matchedPlan.currentServiceMonth - 1) % 6 === 0 ? 'aa01' : null))) : null;
+          
+          if (['initial', 'aa01', 'review'].includes(currentRoundType) && matchedPlan.cmApprovalDate) {
+            // 優先使用 absoluteServiceMonth
+            let currentAbsoluteSM = matchedPlan.absoluteServiceMonth;
+            if (!currentAbsoluteSM && mainStartDate) {
+              currentAbsoluteSM = getCurrentServiceMonth(mainStartDate);
+            }
+            
+            if (currentAbsoluteSM && !historyAA01Records.some(r => r.serviceMonth === currentAbsoluteSM)) {
+              historyAA01Records.push({
+                serviceMonth: currentAbsoluteSM,
+                completedDate: matchedPlan.cmApprovalDate,
+              });
+              if (currentRoundType === 'review') {
+                newCycleBaseMonths.push(currentAbsoluteSM);
+              }
+            }
+          }
+          
+          newCycleBaseMonths.sort((a, b) => a - b);
+          
+          // 更新 cycleBaseMonths
+          if (newCycleBaseMonths.length > migrated.cycleBaseMonths.length) {
+            migrated.cycleBaseMonths = newCycleBaseMonths;
+          }
+          
+          // 補充 cycleStartDate 和 cycleStartServiceMonth（從照顧計畫同步）
+          if (!migrated.cycleStartDate && matchedPlan.cycleStartDate) {
+            migrated.cycleStartDate = matchedPlan.cycleStartDate;
+            migrated.cycleStartServiceMonth = matchedPlan.cycleStartServiceMonth || 1;
+          }
+          // 補充 sourceCurrentServiceMonth
+          if (!migrated.sourceCurrentServiceMonth && matchedPlan.currentServiceMonth) {
+            migrated.sourceCurrentServiceMonth = matchedPlan.currentServiceMonth;
+          }
+          
+          // 補充缺少的 completion 記錄
+          if (migrated.originStartDate) {
+            historyAA01Records.forEach(record => {
+              const existing = migrated.completions.find(comp => comp.serviceMonth === record.serviceMonth);
+              if (!existing && record.completedDate) {
+                migrated.completions.push({
+                  serviceMonth: record.serviceMonth,
+                  type: 'AA01',
+                  completedDate: record.completedDate,
+                  autoImported: true,
+                  fromHistory: true,
+                });
+              }
+            });
+            
+            // 排序 completions
+            migrated.completions.sort((a, b) => a.serviceMonth - b.serviceMonth);
+          }
+        }
+        
+        return migrated;
+      });
+    }
+
+    // ========== 主元件 ==========
+    function AATracker() {
+      const [cases, setCases] = useState([]);
+      const [showExportMenu, setShowExportMenu] = useState(false);
+      const [selectedMonth, setSelectedMonth] = useState(getTaiwanDateString().substring(0, 7));
+      const [selectedYear, setSelectedYear] = useState(getTaiwanDateString().substring(0, 4));
+      const [, setTick] = useState(0);
+      
+      const [searchText, setSearchText] = useState('');
+      const [filterStatus, setFilterStatus] = useState('all');
+
+      const [showImportModal, setShowImportModal] = useState(false);
+      const [importPreview, setImportPreview] = useState(null);
+
+      const today = getTaiwanDateString();
+
+      useEffect(() => {
+        const interval = setInterval(() => setTick(t => t + 1), 60000);
+        return () => clearInterval(interval);
+      }, []);
+
+      useEffect(() => {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          try { setCases(migrateData(JSON.parse(saved))); } catch (e) {}
+        } else {
+          for (const key of OLD_STORAGE_KEYS) {
+            const oldData = localStorage.getItem(key);
+            if (oldData) {
+              try { setCases(migrateData(JSON.parse(oldData))); break; } catch (e) {}
+            }
+          }
+        }
+      }, []);
+
+      useEffect(() => {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(cases));
+      }, [cases]);
+
+      const inputStyle = {
+        padding: '8px 10px',
+        borderRadius: '6px',
+        border: '1px solid rgba(255,255,255,0.15)',
+        background: 'rgba(255,255,255,0.08)',
+        color: 'white',
+        fontSize: '14px',
+      };
+
+      // 處理過的資料
+      const processedCases = useMemo(() => {
+        return cases.map(c => {
+          // 主階段服務月（優先使用從照顧計畫帶入的 sourceCurrentServiceMonth）
+          const mainServiceMonth = c.sourceCurrentServiceMonth 
+            || (c.originStartDate ? getCurrentServiceMonth(c.originStartDate) : null);
+          // 出備階段服務月（如有）
+          const dischargeServiceMonth = c.discharge?.startDate ? getCurrentServiceMonth(c.discharge.startDate) : null;
+          
+          return {
+            ...c,
+            mainServiceMonth,
+            dischargeServiceMonth,
+            pendingTasks: getPendingTasks(c),
+            nextAA01: getNextAA01Info(c),
+          };
+        });
+      }, [cases]);
+
+      // 篩選和排序
+      const filteredCases = useMemo(() => {
+        let result = [...processedCases];
+
+        if (searchText) {
+          const search = searchText.toLowerCase();
+          result = result.filter(c => 
+            c.caseName.toLowerCase().includes(search) || 
+            (c.caseNumber && c.caseNumber.toLowerCase().includes(search))
+          );
+        }
+
+        if (filterStatus === 'pending') {
+          result = result.filter(c => c.pendingTasks.length > 0);
+        } else if (filterStatus === 'overdue') {
+          result = result.filter(c => c.pendingTasks.some(t => t.isOverdue));
+        } else if (filterStatus === 'completed') {
+          result = result.filter(c => c.pendingTasks.length === 0);
+        }
+
+        // 排序邏輯：
+        // 排序優先級：逾期 > AA01 > AA02 > 僅額度 > 無待辦
+        const getPriority = (c) => {
+          const tasks = c.pendingTasks || [];
+          if (tasks.length === 0) return 5;  // 無待辦
+          if (tasks.some(t => t.isOverdue)) return 0;  // 逾期
+          if (tasks.some(t => t.type === 'AA01')) return 1;  // 有 AA01
+          if (tasks.some(t => t.type === 'AA02')) return 2;  // 有 AA02
+          return 3;  // 僅額度
+        };
+        
+        result.sort((a, b) => {
+          const pa = getPriority(a);
+          const pb = getPriority(b);
+          if (pa !== pb) return pa - pb;
+          
+          // 同優先級，按姓名排序
+          return a.caseName.localeCompare(b.caseName, 'zh-TW');
+        });
+
+        return result;
+      }, [processedCases, searchText, filterStatus]);
+
+      // 總覽統計
+      const overallStats = useMemo(() => {
+        let totalPending = 0;
+        let totalOverdue = 0;
+        let totalCompleted = 0;
+
+        processedCases.forEach(c => {
+          c.pendingTasks.forEach(t => {
+            if (t.isOverdue) {
+              totalOverdue++;
+            } else {
+              totalPending++;
+            }
+          });
+          // 主階段完成數
+          totalCompleted += (c.completions || []).length;
+          // 出備階段完成數
+          totalCompleted += (c.discharge?.completions || []).length;
+        });
+
+        return {
+          totalCases: cases.length,
+          totalPending,
+          totalOverdue,
+          totalCompleted,
+        };
+      }, [cases, processedCases]);
+
+      // 月統計（合併出備和主階段）
+      const monthlyStats = useMemo(() => {
+        const stats = { aa01: 0, aa02: 0, aa01Amount: 0, aa02Amount: 0, total: 0 };
+        
+        cases.forEach(c => {
+          // 主階段完成紀錄
+          if (c.originStartDate) {
+            (c.completions || []).forEach(comp => {
+              const statYM = getStatYearMonth(c.originStartDate, comp.serviceMonth, comp.completedDate);
+              if (statYM === selectedMonth) {
+                if (comp.type === 'AA01') {
+                  stats.aa01++;
+                  stats.aa01Amount += AA01_PRICE;
+                } else {
+                  stats.aa02++;
+                  stats.aa02Amount += AA02_PRICE;
+                }
+              }
+            });
+          }
+          
+          // 出備階段完成紀錄
+          if (c.discharge?.startDate) {
+            (c.discharge.completions || []).forEach(comp => {
+              const statYM = getStatYearMonth(c.discharge.startDate, comp.serviceMonth, comp.completedDate);
+              if (statYM === selectedMonth) {
+                if (comp.type === 'AA01') {
+                  stats.aa01++;
+                  stats.aa01Amount += AA01_PRICE;
+                } else {
+                  stats.aa02++;
+                  stats.aa02Amount += AA02_PRICE;
+                }
+              }
+            });
+          }
+        });
+        
+        stats.total = stats.aa01Amount + stats.aa02Amount;
+        return stats;
+      }, [cases, selectedMonth]);
+
+      // 年統計（合併出備和主階段）
+      const yearlyStats = useMemo(() => {
+        const stats = { aa01: 0, aa02: 0, aa01Amount: 0, aa02Amount: 0, total: 0 };
+        
+        cases.forEach(c => {
+          // 主階段完成紀錄
+          if (c.originStartDate) {
+            (c.completions || []).forEach(comp => {
+              const statYM = getStatYearMonth(c.originStartDate, comp.serviceMonth, comp.completedDate);
+              if (statYM.startsWith(selectedYear)) {
+                if (comp.type === 'AA01') {
+                  stats.aa01++;
+                  stats.aa01Amount += AA01_PRICE;
+                } else {
+                  stats.aa02++;
+                  stats.aa02Amount += AA02_PRICE;
+                }
+              }
+            });
+          }
+          
+          // 出備階段完成紀錄
+          if (c.discharge?.startDate) {
+            (c.discharge.completions || []).forEach(comp => {
+              const statYM = getStatYearMonth(c.discharge.startDate, comp.serviceMonth, comp.completedDate);
+              if (statYM.startsWith(selectedYear)) {
+                if (comp.type === 'AA01') {
+                  stats.aa01++;
+                  stats.aa01Amount += AA01_PRICE;
+                } else {
+                  stats.aa02++;
+                  stats.aa02Amount += AA02_PRICE;
+                }
+              }
+            });
+          }
+        });
+        
+        stats.total = stats.aa01Amount + stats.aa02Amount;
+        return stats;
+      }, [cases, selectedYear]);
+
+      // 操作函數
+      const handleComplete = (caseId, task) => {
+        setCases(prev => prev.map(c => {
+          if (c.id !== caseId) return c;
+          const newCompletion = {
+            serviceMonth: task.serviceMonth,
+            type: task.type,
+            completedDate: today,
+          };
+          
+          // 根據 phase 更新對應結構
+          if (task.phase === 'discharge') {
+            return {
+              ...c,
+              discharge: {
+                ...c.discharge,
+                completions: [...(c.discharge?.completions || []), newCompletion],
+              },
+            };
+          } else {
+            return { ...c, completions: [...(c.completions || []), newCompletion] };
+          }
+        }));
+      };
+
+      const handleCompleteQuota = (caseId, task) => {
+        setCases(prev => prev.map(c => {
+          if (c.id !== caseId) return c;
+          const newAllocations = task.quotaTargetMonths.map((tm, i) => ({
+            forServiceMonth: tm,
+            forYearMonth: task.quotaTargetYearMonths[i],
+            allocatedInServiceMonth: task.serviceMonth,
+            allocatedDate: today,
+          }));
+          
+          // 根據 phase 更新對應結構
+          if (task.phase === 'discharge') {
+            return {
+              ...c,
+              discharge: {
+                ...c.discharge,
+                quotaAllocations: [...(c.discharge?.quotaAllocations || []), ...newAllocations],
+              },
+            };
+          } else {
+            return { ...c, quotaAllocations: [...(c.quotaAllocations || []), ...newAllocations] };
+          }
+        }));
+      };
+
+      // 提前AA01（僅主階段）- 將當月標記為基準月刷新點
+      const handleEarlyAA01 = (caseId, task) => {
+        const caseData = cases.find(c => c.id === caseId);
+        if (!caseData || !caseData.originStartDate) return;
+        const currentSM = getCurrentServiceMonth(caseData.originStartDate);
+        setCases(prev => prev.map(c => {
+          if (c.id !== caseId) return c;
+          
+          const newCompletion = {
+            serviceMonth: currentSM,
+            type: 'AA01',
+            completedDate: today,
+            isEarly: true,
+          };
+          
+          // 檢查當月是否已有 completion（例如已按過AA02）
+          const existingIndex = (c.completions || []).findIndex(comp => comp.serviceMonth === currentSM);
+          let newCompletions;
+          
+          if (existingIndex >= 0) {
+            // AA01優先級更高，覆寫當月已有的記錄（通常是AA02）
+            newCompletions = [...c.completions];
+            newCompletions[existingIndex] = newCompletion;
+          } else {
+            // 當月無記錄，直接新增
+            newCompletions = [...(c.completions || []), newCompletion];
+          }
+          
+          return {
+            ...c,
+            completions: newCompletions,
+            cycleBaseMonths: [...(c.cycleBaseMonths || []), currentSM],
+          };
+        }));
+      };
+
+      const handleDelete = (id) => {
+        if (confirm('確定刪除此個案？')) {
+          setCases(prev => prev.filter(c => c.id !== id));
+        }
+      };
+
+      // 匯入照顧計畫
+      const handleImportFromCarePlan = () => {
+        let carePlanData = null;
+        for (const key of CARE_PLAN_KEYS) {
+          carePlanData = localStorage.getItem(key);
+          if (carePlanData) break;
+        }
+        
+        if (!carePlanData) {
+          alert('找不到照顧計畫資料，請先在照顧計畫時效追蹤器中建立資料');
+          return;
+        }
+
+        try {
+          const plans = JSON.parse(carePlanData);
+          const preview = {
+            total: plans.length,
+            eligible: [],
+            duplicate: [],
+            ineligible: [],
+            toImport: [],
+          };
+
+          plans.forEach(plan => {
+            const isPAC = plan.sourceType === 'pac';
+            const currentServiceMonth = plan.currentServiceMonth ?? 1;
+            // 出備階段：出院準備且沒有照專簽審日期
+            const isDischargePhase = isPAC && !plan.cmApprovalDate;
+            
+            // 出備階段需要出院日期，其他階段需要照專簽審日期
+            const hasStartDate = isDischargePhase ? plan.dischargeDate : plan.cmApprovalDate;
+
+            if (!hasStartDate) {
+              preview.ineligible.push({
+                plan,
+                reason: isDischargePhase ? '尚未填入出院日期' : '尚未完成照專簽審',
+              });
+              return;
+            }
+
+            // 重複檢查：根據 sourcePlanId 或姓名+起算日
+            const isDuplicate = cases.some(c => {
+              if (c.sourcePlanId === plan.id) return true;
+              // 出備階段：比對 discharge.startDate
+              if (isDischargePhase && c.discharge?.startDate === hasStartDate && c.caseName === plan.caseName) return true;
+              // 主階段：比對 originStartDate
+              if (!isDischargePhase && c.originStartDate === hasStartDate && c.caseName === plan.caseName) return true;
+              return false;
+            });
+            
+            if (isDuplicate) {
+              preview.duplicate.push({ plan, reason: '已存在' });
+              return;
+            }
+
+            const converted = convertCarePlanToAACase(plan, today);
+            if (converted) {
+              preview.eligible.push(plan);
+              preview.toImport.push(converted);
+            }
+          });
+
+          setImportPreview(preview);
+          setShowImportModal(true);
+        } catch (e) {
+          alert('讀取失敗：' + e.message);
+        }
+      };
+
+      const confirmImport = () => {
+        if (!importPreview || importPreview.toImport.length === 0) return;
+        setCases(prev => [...importPreview.toImport, ...prev]);
+        setShowImportModal(false);
+        setImportPreview(null);
+        alert(`成功匯入 ${importPreview.toImport.length} 筆個案！`);
+      };
+
+      // 備份還原
+      const handleBackup = () => {
+        const exportData = {
+          toolFamily: TOOL_FAMILY,
+          toolType: TOOL_TYPE,
+          toolVersion: TOOL_VERSION,
+          exportDate: today,
+          data: cases,
+        };
+        const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `A碼追蹤備份_${today}.json`;
+        link.click();
+      };
+
+      const handleRestore = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          try {
+            const parsed = JSON.parse(event.target.result);
+            let data;
+            if (parsed.toolFamily === TOOL_FAMILY && parsed.data) {
+              data = parsed.data;
+            } else if (Array.isArray(parsed)) {
+              data = parsed;
+            } else {
+              alert('檔案格式錯誤');
+              return;
+            }
+
+            if (confirm(`確定要還原 ${data.length} 筆資料？`)) {
+              setCases(migrateData(data));
+              alert('還原成功！');
+            }
+          } catch (err) {
+            alert('讀取失敗：' + err.message);
+          }
+        };
+        reader.readAsText(file);
+        e.target.value = '';
+      };
+
+      const handleDataFix = () => {
+        // 讀取照顧計畫資料以同步 cycleBaseMonths
+        let carePlans = [];
+        for (const key of CARE_PLAN_KEYS) {
+          const data = localStorage.getItem(key);
+          if (data) {
+            try { carePlans = JSON.parse(data); break; } catch (e) {}
+          }
+        }
+        
+        // 建立照顧計畫的快速查找 Map（支援多種匹配方式）
+        const carePlanMap = new Map();
+        carePlans.forEach(plan => {
+          if (plan.id) carePlanMap.set(`id:${plan.id}`, plan);
+          if (plan.caseName) {
+            // 新版欄位
+            if (plan.originStartDate) {
+              carePlanMap.set(`name:${plan.caseName}|${plan.originStartDate}`, plan);
+            }
+            if (plan.cmApprovalDate) {
+              carePlanMap.set(`name:${plan.caseName}|${plan.cmApprovalDate}`, plan);
+            }
+            if (plan.cycleStartDate) {
+              carePlanMap.set(`name:${plan.caseName}|${plan.cycleStartDate}`, plan);
+            }
+            // 只用姓名匹配（作為 fallback）
+            if (!carePlanMap.has(`nameonly:${plan.caseName}`)) {
+              carePlanMap.set(`nameonly:${plan.caseName}`, plan);
+            }
+          }
+        });
+        
+        const fixes = [];
+        
+        const updatedCases = cases.map(c => {
+          const caseFixes = [];
+          let updated = { ...c };
+          
+          // ===== 1. 舊欄位名遷移 =====
+          // startDate → originStartDate
+          if (updated.startDate && !updated.originStartDate) {
+            updated.originStartDate = updated.startDate;
+            delete updated.startDate;
+            caseFixes.push('startDate→originStartDate');
+          }
+          // earlyAA01 → cycleBaseMonths
+          if (updated.earlyAA01 && (!updated.cycleBaseMonths || updated.cycleBaseMonths.length === 0)) {
+            updated.cycleBaseMonths = updated.earlyAA01;
+            delete updated.earlyAA01;
+            caseFixes.push('earlyAA01→cycleBaseMonths');
+          }
+          
+          // ===== 2. 確保基本欄位存在 =====
+          if (updated.sourceType === undefined) {
+            updated.sourceType = '1966';
+            caseFixes.push('sourceType');
+          }
+          if (updated.completions === undefined) {
+            updated.completions = [];
+            caseFixes.push('completions');
+          }
+          if (updated.quotaAllocations === undefined) {
+            updated.quotaAllocations = [];
+            caseFixes.push('quotaAllocations');
+          }
+          if (updated.cycleBaseMonths === undefined) {
+            updated.cycleBaseMonths = [];
+            caseFixes.push('cycleBaseMonths');
+          }
+          if (updated.isFirstCycle === undefined) {
+            // 出院準備初評後不是新案
+            updated.isFirstCycle = updated.sourceType !== 'pac' || !updated.originStartDate;
+            caseFixes.push('isFirstCycle');
+          }
+          
+          // ===== 3. 出院準備案源：確保 discharge 結構完整 =====
+          if (updated.sourceType === 'pac') {
+            if (updated.discharge && !updated.discharge.completions) {
+              updated.discharge.completions = [];
+              caseFixes.push('discharge.completions');
+            }
+            if (updated.discharge && !updated.discharge.quotaAllocations) {
+              updated.discharge.quotaAllocations = [];
+              caseFixes.push('discharge.quotaAllocations');
+            }
+          }
+          
+          // ===== 4. 從照顧計畫同步 cycleBaseMonths =====
+          let matchedPlan = null;
+          
+          // 嘗試多種匹配方式
+          if (c.sourcePlanId) {
+            matchedPlan = carePlanMap.get(`id:${c.sourcePlanId}`);
+          }
+          if (!matchedPlan && c.caseName && updated.originStartDate) {
+            matchedPlan = carePlanMap.get(`name:${c.caseName}|${updated.originStartDate}`);
+          }
+          if (!matchedPlan && c.caseName && c.startDate) {
+            // 舊欄位名
+            matchedPlan = carePlanMap.get(`name:${c.caseName}|${c.startDate}`);
+          }
+          if (!matchedPlan && c.caseName) {
+            // 只用姓名匹配（最後手段）
+            matchedPlan = carePlanMap.get(`nameonly:${c.caseName}`);
+          }
+          
+          if (matchedPlan) {
+            const history = matchedPlan.history || [];
+            const mainStartDate = matchedPlan.originStartDate || matchedPlan.cycleStartDate || matchedPlan.cmApprovalDate || updated.originStartDate;
+            const newCycleBaseMonths = [];
+            
+            // 從 history 提取複評的絕對服務月
+            history.forEach(h => {
+              if (h.type === 'review') {
+                let absoluteSM = h.absoluteServiceMonth;
+                if (!absoluteSM && mainStartDate) {
+                  const dateForCalc = h.dates?.supervisorApprovalDate || h.dates?.cmApprovalDate || h.completedDate;
+                  if (dateForCalc) {
+                    absoluteSM = calculateAbsoluteServiceMonth(mainStartDate, dateForCalc);
+                  }
+                }
+                if (absoluteSM) {
+                  newCycleBaseMonths.push(absoluteSM);
+                }
+              }
+            });
+            
+            // 檢查當前輪次是否為複評
+            if (matchedPlan.currentServiceMonth > 1 && (matchedPlan.currentServiceMonth - 1) % 12 === 0) {
+              let currentAbsoluteSM = matchedPlan.absoluteServiceMonth;
+              if (!currentAbsoluteSM && mainStartDate && matchedPlan.cmApprovalDate) {
+                currentAbsoluteSM = calculateAbsoluteServiceMonth(mainStartDate, matchedPlan.cmApprovalDate);
+              }
+              if (currentAbsoluteSM && !newCycleBaseMonths.includes(currentAbsoluteSM)) {
+                newCycleBaseMonths.push(currentAbsoluteSM);
+              }
+            }
+            
+            newCycleBaseMonths.sort((a, b) => a - b);
+            
+            // 比較是否有差異
+            const oldStr = JSON.stringify(updated.cycleBaseMonths || []);
+            const newStr = JSON.stringify(newCycleBaseMonths);
+            if (oldStr !== newStr && newCycleBaseMonths.length > 0) {
+              updated.cycleBaseMonths = newCycleBaseMonths;
+              caseFixes.push(`cycleBaseMonths(${newCycleBaseMonths.join(',')})`);
+            }
+            
+            // 同步 originStartDate（如果子工具缺失但母工具有）
+            if (!updated.originStartDate && mainStartDate) {
+              updated.originStartDate = mainStartDate;
+              caseFixes.push('originStartDate(從母工具同步)');
+            }
+          }
+          
+          // ===== 記錄修正 =====
+          if (caseFixes.length > 0) {
+            fixes.push({ name: c.caseName, caseNumber: c.caseNumber, fixes: caseFixes });
+          }
+          
+          return updated;
+        });
+        
+        if (fixes.length > 0) {
+          setCases(updatedCases);
+          const summary = fixes.map(f => 
+            `• ${f.name}${f.caseNumber ? ` (${f.caseNumber})` : ''}: ${f.fixes.join(', ')}`
+          ).join('\n');
+          alert(`已校正 ${fixes.length} 筆個案資料：\n\n${summary}`);
+        } else {
+          alert('所有個案資料都是正確的，無需校正。');
+        }
+      };
+
+      // 匯出
+      const exportToExcel = () => {
+        const data = [];
+        cases.forEach(c => {
+          const cycleBaseInfo = (c.cycleBaseMonths || []).length > 0 ? `複評服務月: ${c.cycleBaseMonths.join(',')}` : '';
+          
+          // 主階段
+          if (c.originStartDate) {
+            (c.completions || []).forEach(comp => {
+              const statYM = getStatYearMonth(c.originStartDate, comp.serviceMonth, comp.completedDate);
+              if (statYM === selectedMonth) {
+                data.push({
+                  '個案姓名': c.caseName,
+                  '案號': c.caseNumber || '',
+                  '案源類型': c.sourceType === 'pac' ? '出院準備案源' : '1966案源',
+                  '階段': '主階段',
+                  '服務月': comp.serviceMonth,
+                  '類型': comp.type,
+                  '金額': comp.type === 'AA01' ? AA01_PRICE : AA02_PRICE,
+                  '完成日期': comp.completedDate,
+                  '基準月刷新': cycleBaseInfo,
+                });
+              }
+            });
+          }
+          
+          // 出備階段
+          if (c.discharge?.startDate) {
+            (c.discharge.completions || []).forEach(comp => {
+              const statYM = getStatYearMonth(c.discharge.startDate, comp.serviceMonth, comp.completedDate);
+              if (statYM === selectedMonth) {
+                data.push({
+                  '個案姓名': c.caseName,
+                  '案號': c.caseNumber || '',
+                  '案源類型': '出院準備案源',
+                  '階段': '出備',
+                  '服務月': comp.serviceMonth,
+                  '類型': comp.type,
+                  '金額': comp.type === 'AA01' ? AA01_PRICE : AA02_PRICE,
+                  '完成日期': comp.completedDate,
+                  '基準月刷新': '',
+                });
+              }
+            });
+          }
+        });
+        if (!data.length) {
+          alert('當月無完成紀錄');
+          return;
+        }
+        const ws = XLSX.utils.json_to_sheet(data);
+        ws['!cols'] = Array(9).fill({ wch: 14 });
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'A碼紀錄');
+        XLSX.writeFile(wb, `A碼紀錄_${selectedMonth}.xlsx`);
+        setShowExportMenu(false);
+      };
+
+      const exportToCSV = () => {
+        const data = [];
+        cases.forEach(c => {
+          const cycleBaseInfo = (c.cycleBaseMonths || []).length > 0 ? `複評服務月: ${c.cycleBaseMonths.join(',')}` : '';
+          
+          // 主階段
+          if (c.originStartDate) {
+            (c.completions || []).forEach(comp => {
+              const statYM = getStatYearMonth(c.originStartDate, comp.serviceMonth, comp.completedDate);
+              if (statYM === selectedMonth) {
+                data.push({
+                  '個案姓名': c.caseName,
+                  '案號': c.caseNumber || '',
+                  '案源類型': c.sourceType === 'pac' ? '出院準備案源' : '1966案源',
+                  '階段': '主階段',
+                  '服務月': comp.serviceMonth,
+                  '類型': comp.type,
+                  '金額': comp.type === 'AA01' ? AA01_PRICE : AA02_PRICE,
+                  '完成日期': comp.completedDate,
+                  '基準月刷新': cycleBaseInfo,
+                });
+              }
+            });
+          }
+          
+          // 出備階段
+          if (c.discharge?.startDate) {
+            (c.discharge.completions || []).forEach(comp => {
+              const statYM = getStatYearMonth(c.discharge.startDate, comp.serviceMonth, comp.completedDate);
+              if (statYM === selectedMonth) {
+                data.push({
+                  '個案姓名': c.caseName,
+                  '案號': c.caseNumber || '',
+                  '案源類型': '出院準備案源',
+                  '階段': '出備',
+                  '服務月': comp.serviceMonth,
+                  '類型': comp.type,
+                  '金額': comp.type === 'AA01' ? AA01_PRICE : AA02_PRICE,
+                  '完成日期': comp.completedDate,
+                  '基準月刷新': '',
+                });
+              }
+            });
+          }
+        });
+        if (!data.length) {
+          alert('當月無完成紀錄');
+          return;
+        }
+        const headers = Object.keys(data[0]);
+        const csv = [headers.join(','), ...data.map(row => headers.map(h => {
+          let v = row[h]?.toString() || '';
+          if (v.includes(',') || v.includes('"') || v.includes('\n')) {
+            v = '"' + v.replace(/"/g, '""') + '"';
+          }
+          return v;
+        }).join(','))].join('\n');
+        const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `A碼紀錄_${selectedMonth}.csv`;
+        link.click();
+        setShowExportMenu(false);
+      };
+
+      return (
+        <div style={{
+          minHeight: '100vh',
+          background: 'linear-gradient(180deg, #0f172a 0%, #1e1b4b 100%)',
+          padding: '16px',
+          color: '#e2e8f0',
+        }}>
+          <div style={{ maxWidth: '1100px', margin: '0 auto' }}>
+            {/* Header */}
+            <div style={{ textAlign: 'center', marginBottom: '16px' }}>
+              <h1 style={{
+                fontSize: '22px', fontWeight: '700', margin: 0,
+                background: 'linear-gradient(135deg, #a855f7 0%, #6366f1 100%)',
+                WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
+              }}>
+                A碼時效追蹤器
+              </h1>
+              <div style={{ fontSize: '10px', color: '#64748b', marginTop: '2px', marginBottom: '12px' }}>
+                長照管理工具組 · 子工具
+              </div>
+
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'center' }}>
+                <button onClick={handleBackup} className="btn" style={{
+                  padding: '8px 12px', borderRadius: '8px',
+                  border: '1px solid rgba(255,255,255,0.2)',
+                  background: 'rgba(255,255,255,0.05)',
+                  color: '#94a3b8', fontSize: '12px',
+                }}>備份</button>
+                <label className="btn" style={{
+                  padding: '8px 12px', borderRadius: '8px',
+                  border: '1px solid rgba(255,255,255,0.2)',
+                  background: 'rgba(255,255,255,0.05)',
+                  color: '#94a3b8', fontSize: '12px', cursor: 'pointer',
+                }}>
+                  還原
+                  <input type="file" accept=".json" onChange={handleRestore} style={{ display: 'none' }} />
+                </label>
+                <button onClick={handleDataFix} className="btn" style={{
+                  padding: '8px 12px', borderRadius: '8px',
+                  border: '1px solid rgba(251,191,36,0.3)',
+                  background: 'rgba(251,191,36,0.1)',
+                  color: '#fbbf24', fontSize: '12px',
+                }}>🔧 資料校正</button>
+
+                {cases.length > 0 && (
+                  <div style={{ position: 'relative' }}>
+                    <button onClick={() => setShowExportMenu(!showExportMenu)} className="btn" style={{
+                      padding: '8px 12px', borderRadius: '8px',
+                      border: '1px solid rgba(255,255,255,0.2)',
+                      background: 'rgba(255,255,255,0.05)',
+                      color: '#94a3b8', fontSize: '12px',
+                    }}>
+                      匯出 ▾
+                    </button>
+                    {showExportMenu && (
+                      <React.Fragment>
+                        <div style={{ position: 'fixed', inset: 0, zIndex: 50 }} onClick={() => setShowExportMenu(false)} />
+                        <div style={{
+                          position: 'absolute', top: '100%', right: 0, marginTop: '4px',
+                          background: '#1e293b', border: '1px solid rgba(255,255,255,0.15)',
+                          borderRadius: '8px', padding: '4px', minWidth: '120px', zIndex: 100,
+                        }}>
+                          <button onClick={exportToExcel} style={{ display: 'block', width: '100%', padding: '10px 12px', textAlign: 'left', background: 'transparent', border: 'none', color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', borderRadius: '6px' }}>Excel</button>
+                          <button onClick={exportToCSV} style={{ display: 'block', width: '100%', padding: '10px 12px', textAlign: 'left', background: 'transparent', border: 'none', color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', borderRadius: '6px' }}>CSV</button>
+                        </div>
+                      </React.Fragment>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* 匯入按鈕區 */}
+            <div style={{
+              background: 'rgba(129,140,248,0.1)',
+              border: '1px solid rgba(129,140,248,0.3)',
+              borderRadius: '8px',
+              padding: '16px',
+              marginBottom: '16px',
+              textAlign: 'center',
+            }}>
+              <button onClick={handleImportFromCarePlan} className="btn" style={{
+                padding: '12px 24px', borderRadius: '8px', border: 'none',
+                background: 'linear-gradient(135deg, #818cf8 0%, #6366f1 100%)',
+                color: 'white', fontSize: '14px', fontWeight: '500',
+              }}>
+                📥 從照顧計畫匯入
+              </button>
+              <div style={{ fontSize: '11px', color: '#64748b', marginTop: '8px' }}>
+                請先在「照顧計畫時效追蹤器」建立個案資料
+              </div>
+            </div>
+
+            {/* 統計區塊 */}
+            {cases.length > 0 && (
+              <div style={{ marginBottom: '16px' }}>
+                {/* 第一列：總覽 */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '8px', marginBottom: '8px' }}>
+                  <div style={{ background: 'rgba(129,140,248,0.15)', borderRadius: '8px', padding: '10px', textAlign: 'center', border: '1px solid rgba(129,140,248,0.33)' }}>
+                    <div style={{ fontSize: '22px', fontWeight: '700', color: '#818cf8' }}>{overallStats.totalCases}</div>
+                    <div style={{ fontSize: '11px', color: '#94a3b8' }}>總個案數</div>
+                  </div>
+                  <div style={{ background: 'rgba(251,191,36,0.15)', borderRadius: '8px', padding: '10px', textAlign: 'center', border: '1px solid rgba(251,191,36,0.33)' }}>
+                    <div style={{ fontSize: '22px', fontWeight: '700', color: '#fbbf24' }}>{overallStats.totalPending}</div>
+                    <div style={{ fontSize: '11px', color: '#94a3b8' }}>總待辦數</div>
+                  </div>
+                  <div style={{ background: overallStats.totalOverdue > 0 ? 'rgba(239,68,68,0.15)' : 'rgba(34,197,94,0.1)', borderRadius: '8px', padding: '10px', textAlign: 'center', border: overallStats.totalOverdue > 0 ? '1px solid rgba(239,68,68,0.33)' : '1px solid rgba(34,197,94,0.2)' }}>
+                    <div style={{ fontSize: '22px', fontWeight: '700', color: overallStats.totalOverdue > 0 ? '#ef4444' : '#22c55e' }}>{overallStats.totalOverdue}</div>
+                    <div style={{ fontSize: '11px', color: '#94a3b8' }}>總逾期數</div>
+                  </div>
+                  <div style={{ background: 'rgba(34,197,94,0.15)', borderRadius: '8px', padding: '10px', textAlign: 'center', border: '1px solid rgba(34,197,94,0.33)' }}>
+                    <div style={{ fontSize: '22px', fontWeight: '700', color: '#22c55e' }}>{overallStats.totalCompleted}</div>
+                    <div style={{ fontSize: '11px', color: '#94a3b8' }}>總完成數</div>
+                  </div>
+                </div>
+
+                {/* 第二列：月統計 + 年統計 */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                  {/* 月統計 */}
+                  <div style={{ padding: '12px', background: 'rgba(255,255,255,0.03)', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                      <span style={{ fontSize: '12px', fontWeight: '500', color: '#94a3b8' }}>月度統計</span>
+                      <input type="month" value={selectedMonth} onChange={(e) => setSelectedMonth(e.target.value)} style={{ ...inputStyle, padding: '4px 8px', fontSize: '11px', width: '130px' }} />
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '6px' }}>
+                      <div style={{ background: 'rgba(168,85,247,0.12)', borderRadius: '6px', padding: '8px', textAlign: 'center' }}>
+                        <div style={{ fontSize: '16px', fontWeight: '700', color: '#a855f7' }}>{monthlyStats.aa01}</div>
+                        <div style={{ fontSize: '10px', color: '#94a3b8' }}>AA01</div>
+                      </div>
+                      <div style={{ background: 'rgba(59,130,246,0.12)', borderRadius: '6px', padding: '8px', textAlign: 'center' }}>
+                        <div style={{ fontSize: '16px', fontWeight: '700', color: '#3b82f6' }}>{monthlyStats.aa02}</div>
+                        <div style={{ fontSize: '10px', color: '#94a3b8' }}>AA02</div>
+                      </div>
+                      <div style={{ background: 'rgba(34,197,94,0.12)', borderRadius: '6px', padding: '8px', textAlign: 'center' }}>
+                        <div style={{ fontSize: '14px', fontWeight: '700', color: '#22c55e' }}>${monthlyStats.total.toLocaleString()}</div>
+                        <div style={{ fontSize: '10px', color: '#94a3b8' }}>合計金額</div>
+                      </div>
+                    </div>
+                  </div>
+                  {/* 年統計 */}
+                  <div style={{ padding: '12px', background: 'rgba(255,255,255,0.03)', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                      <span style={{ fontSize: '12px', fontWeight: '500', color: '#94a3b8' }}>年度統計</span>
+                      <select value={selectedYear} onChange={(e) => setSelectedYear(e.target.value)} style={{ ...inputStyle, padding: '4px 8px', fontSize: '11px', width: '80px' }}>
+                        {[...Array(5)].map((_, i) => {
+                          const y = new Date().getFullYear() - i;
+                          return <option key={y} value={y}>{y}</option>;
+                        })}
+                      </select>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '6px' }}>
+                      <div style={{ background: 'rgba(168,85,247,0.12)', borderRadius: '6px', padding: '8px', textAlign: 'center' }}>
+                        <div style={{ fontSize: '16px', fontWeight: '700', color: '#a855f7' }}>{yearlyStats.aa01}</div>
+                        <div style={{ fontSize: '10px', color: '#94a3b8' }}>AA01</div>
+                      </div>
+                      <div style={{ background: 'rgba(59,130,246,0.12)', borderRadius: '6px', padding: '8px', textAlign: 'center' }}>
+                        <div style={{ fontSize: '16px', fontWeight: '700', color: '#3b82f6' }}>{yearlyStats.aa02}</div>
+                        <div style={{ fontSize: '10px', color: '#94a3b8' }}>AA02</div>
+                      </div>
+                      <div style={{ background: 'rgba(34,197,94,0.12)', borderRadius: '6px', padding: '8px', textAlign: 'center' }}>
+                        <div style={{ fontSize: '14px', fontWeight: '700', color: '#22c55e' }}>${yearlyStats.total.toLocaleString()}</div>
+                        <div style={{ fontSize: '10px', color: '#94a3b8' }}>合計金額</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* 搜尋篩選排序 */}
+            {cases.length > 0 && (
+              <div style={{ display: 'flex', gap: '10px', marginBottom: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
+                <input
+                  type="text"
+                  placeholder="搜尋姓名或案號..."
+                  value={searchText}
+                  onChange={(e) => setSearchText(e.target.value)}
+                  style={{ ...inputStyle, width: '150px' }}
+                />
+                <select
+                  value={filterStatus}
+                  onChange={(e) => setFilterStatus(e.target.value)}
+                  style={{ ...inputStyle, width: '100px' }}
+                >
+                  <option value="all">全部狀態</option>
+                  <option value="pending">有待辦</option>
+                  <option value="overdue">有逾期</option>
+                  <option value="completed">已完成</option>
+                </select>
+                <span style={{ fontSize: '12px', color: '#64748b' }}>
+                  顯示 {filteredCases.length} / {cases.length} 筆
+                </span>
+              </div>
+            )}
+
+            {/* 個案列表 */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {cases.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '60px 20px', color: '#64748b' }}>
+                  <div style={{ fontSize: '48px', marginBottom: '16px' }}>📥</div>
+                  <p style={{ fontSize: '16px', marginBottom: '8px' }}>尚無資料</p>
+                  <p style={{ fontSize: '13px' }}>請先在「照顧計畫時效追蹤器」建立個案，再點擊上方「從照顧計畫匯入」</p>
+                </div>
+              ) : filteredCases.map(caseData => {
+                const hasOverdue = caseData.pendingTasks.some(t => t.isOverdue);
+                const isPAC = caseData.sourceType === 'pac';
+                
+                // 顯示階段資訊
+                const hasDischarge = caseData.discharge?.startDate;
+                const hasMain = caseData.originStartDate;
+                const isDischargeOnly = hasDischarge && !hasMain;
+
+                return (
+                  <div key={caseData.id} style={{
+                    padding: '12px 14px', borderRadius: '10px',
+                    background: hasOverdue ? 'rgba(239,68,68,0.08)' : 'rgba(255,255,255,0.03)',
+                    border: hasOverdue ? '1px solid rgba(239,68,68,0.3)' : '1px solid rgba(255,255,255,0.08)',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '10px' }}>
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span style={{ fontWeight: '600', fontSize: '15px' }}>{caseData.caseName}</span>
+                          {caseData.caseNumber && <span style={{ fontSize: '11px', color: '#64748b' }}>{caseData.caseNumber}</span>}
+                          <span style={{ 
+                            fontSize: '9px', padding: '2px 6px', borderRadius: '4px', 
+                            background: isPAC ? 'rgba(6,182,212,0.2)' : 'rgba(59,130,246,0.2)', 
+                            color: isPAC ? '#22d3ee' : '#60a5fa' 
+                          }}>
+                            {isPAC ? '出準' : '1966'}
+                          </span>
+                          {isPAC && isDischargeOnly && (
+                            <span style={{ fontSize: '9px', padding: '2px 6px', borderRadius: '4px', background: 'rgba(251,191,36,0.2)', color: '#fbbf24' }}>
+                              出備中
+                            </span>
+                          )}
+                          {(caseData.cycleBaseMonths || []).length > 0 && (
+                            <span style={{ fontSize: '9px', padding: '2px 6px', borderRadius: '4px', background: 'rgba(168,85,247,0.2)', color: '#c084fc' }}>
+                              {caseData.cycleBaseMonths.length}次複評
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ fontSize: '11px', color: '#64748b', marginTop: '2px' }}>
+                          {isDischargeOnly ? (
+                            <>出備第 {caseData.dischargeServiceMonth} 月 · 出院 {formatDate(caseData.discharge.startDate)}</>
+                          ) : hasMain ? (
+                            <>
+                              第 {caseData.mainServiceMonth} 個服務月 · 起始 {formatDate(caseData.originStartDate)}
+                              {caseData.nextAA01 && (
+                                <span style={{ marginLeft: '8px', color: '#a855f7' }}>
+                                  · 下次AA01 {formatYearMonth(caseData.nextAA01.yearMonth)}
+                                </span>
+                              )}
+                            </>
+                          ) : (
+                            <>尚未開始主階段</>
+                          )}
+                        </div>
+                      </div>
+                      <button onClick={() => handleDelete(caseData.id)} className="btn" style={{ 
+                        padding: '4px 8px', borderRadius: '4px', 
+                        border: '1px solid rgba(248,113,113,0.3)', 
+                        background: 'transparent', color: '#f87171', fontSize: '11px' 
+                      }}>刪除</button>
+                    </div>
+
+                    {/* 待辦任務 */}
+                    {caseData.pendingTasks.length > 0 && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                        {caseData.pendingTasks.map((task, i) => (
+                          <div key={i} style={{
+                            display: 'flex', alignItems: 'center', gap: '8px',
+                            padding: '8px 12px', borderRadius: '8px',
+                            background: task.isOverdue ? 'rgba(239,68,68,0.15)' : 
+                                       task.type === 'QUOTA' ? 'rgba(6,182,212,0.1)' : 
+                                       task.phase === 'discharge' ? 'rgba(251,191,36,0.08)' : 'rgba(34,197,94,0.1)',
+                            border: task.isOverdue ? '1px solid rgba(239,68,68,0.3)' : 
+                                   task.phase === 'discharge' ? '1px solid rgba(251,191,36,0.2)' : '1px solid transparent',
+                          }}>
+                            <div>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                {task.phase === 'discharge' && <span style={{ fontSize: '9px', color: '#fbbf24' }}>出備</span>}
+                                <span style={{
+                                  fontSize: '11px', fontWeight: '600',
+                                  color: task.isOverdue ? '#f87171' : 
+                                        task.type === 'AA01' ? '#c084fc' : 
+                                        task.type === 'QUOTA' ? '#22d3ee' : '#60a5fa',
+                                }}>
+                                  {task.type === 'QUOTA' ? '額度' : task.type}
+                                </span>
+                                <span style={{ fontSize: '11px', color: '#94a3b8' }}>
+                                  {task.type === 'QUOTA' ? task.quotaTargetYearMonths.map(formatYearMonth).join('、') : formatYearMonth(task.yearMonth)}
+                                </span>
+                                {task.isNewCase && <span style={{ fontSize: '9px', color: '#f97316', background: 'rgba(249,115,22,0.2)', padding: '1px 4px', borderRadius: '3px' }}>新案</span>}
+                              </div>
+                              {task.isOverdue && <div style={{ fontSize: '10px', color: '#f87171', marginTop: '2px' }}>逾期 {task.daysOverdue} 天</div>}
+                            </div>
+                            {!task.isOverdue && (
+                              <button onClick={() => task.type === 'QUOTA' ? handleCompleteQuota(caseData.id, task) : handleComplete(caseData.id, task)} className="btn btn-advance" style={{ 
+                                padding: '4px 10px', borderRadius: '4px', border: 'none', 
+                                background: task.type === 'QUOTA' ? 'linear-gradient(135deg, #06b6d4 0%, #0891b2 100%)' : 'linear-gradient(135deg, #22c55e 0%, #16a34a 100%)', 
+                                color: 'white', fontSize: '11px', fontWeight: '500' 
+                              }}>完成</button>
+                            )}
+                          </div>
+                        ))}
+                        {/* 提前按鈕：當有主階段 AA02 待辦時，獨立顯示在最右邊 */}
+                        {(() => {
+                          const aa02Task = caseData.pendingTasks.find(t => t.type === 'AA02' && t.phase !== 'discharge' && !t.isOverdue);
+                          if (!aa02Task) return null;
+                          return (
+                            <div style={{
+                              display: 'flex', alignItems: 'center', gap: '8px',
+                              padding: '8px 12px', borderRadius: '8px',
+                              background: 'rgba(251,191,36,0.1)',
+                              border: '1px solid rgba(251,191,36,0.3)',
+                              marginLeft: 'auto',
+                            }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <span style={{ fontSize: '11px', fontWeight: '600', color: '#fbbf24' }}>AA01</span>
+                                <span style={{ fontSize: '11px', color: '#94a3b8' }}>{formatYearMonth(aa02Task.yearMonth)}</span>
+                              </div>
+                              <button onClick={() => handleEarlyAA01(caseData.id, aa02Task)} className="btn" style={{ 
+                                padding: '4px 10px', borderRadius: '4px', border: 'none', 
+                                background: 'linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%)', 
+                                color: 'white', fontSize: '11px', fontWeight: '500' 
+                              }}>提前</button>
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    )}
+
+                    {/* 無待辦時顯示最近完成 */}
+                    {caseData.pendingTasks.length === 0 && (
+                      <div style={{ fontSize: '11px', color: '#64748b' }}>
+                        ✓ 當月無待辦
+                        {/* 主階段最近完成 */}
+                        {caseData.originStartDate && (caseData.completions || []).slice(-2).reverse().map((comp, i) => (
+                          <span key={`main-${i}`} style={{ marginLeft: '8px' }}>
+                            <span style={{ color: comp.type === 'AA01' ? '#c084fc' : '#60a5fa' }}>{comp.type}</span>
+                            <span style={{ marginLeft: '4px' }}>{formatYearMonth(getYearMonth(caseData.originStartDate, comp.serviceMonth))}</span>
+                          </span>
+                        ))}
+                        {/* 出備階段最近完成 */}
+                        {caseData.discharge?.startDate && (caseData.discharge.completions || []).slice(-2).reverse().map((comp, i) => (
+                          <span key={`discharge-${i}`} style={{ marginLeft: '8px' }}>
+                            <span style={{ fontSize: '9px', color: '#fbbf24' }}>出備</span>
+                            <span style={{ color: comp.type === 'AA01' ? '#c084fc' : '#60a5fa', marginLeft: '4px' }}>{comp.type}</span>
+                            <span style={{ marginLeft: '4px' }}>{formatYearMonth(getYearMonth(caseData.discharge.startDate, comp.serviceMonth))}</span>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* 說明區 */}
+            <footer style={{ marginTop: '20px', padding: '16px', background: 'rgba(255,255,255,0.03)', borderRadius: '8px', fontSize: '11px', color: '#64748b', textAlign: 'center' }}>
+              <p style={{ margin: '0 0 8px', fontWeight: '500', color: '#94a3b8' }}>使用說明</p>
+              <p style={{ margin: '0 0 4px' }}>
+                <span style={{ color: '#a855f7' }}>■ AA01</span> 照顧計畫擬訂與服務連結（1,700元）：家訪月份
+              </p>
+              <p style={{ margin: '0 0 4px' }}>
+                <span style={{ color: '#3b82f6' }}>■ AA02</span> 照顧管理（400元）：非家訪月份
+              </p>
+              <p style={{ margin: '0 0 4px' }}>
+                <span style={{ color: '#22d3ee' }}>■ 額度</span> 次月額度分配：每月需開立次月碼別額度；<span style={{ color: '#f97316' }}>新案首月開當月+次月</span>
+              </p>
+              <p style={{ margin: '0 0 8px' }}>
+                <span style={{ color: '#fbbf24' }}>■ 提前</span>：AA02 待辦旁的<span style={{ color: '#fbbf24' }}>「提前」</span>按鈕可將當月覆蓋為 AA01（家訪），並以此為新起點重新計算後續週期
+              </p>
+              
+              <div style={{ borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '10px', marginTop: '10px' }}>
+                <p style={{ margin: '0 0 6px', fontWeight: '500', color: '#94a3b8' }}>週期說明（基準月刷新機制）</p>
+                <p style={{ margin: '0 0 4px', lineHeight: '1.6' }}>
+                  <strong style={{ color: '#c084fc' }}>基準月</strong>：新案=初評月；舊案=最近一次複評月。<strong style={{ color: '#a855f7' }}>AA01</strong>=基準月+6，<strong style={{ color: '#f87171' }}>複評</strong>=基準月+12
+                </p>
+                <p style={{ margin: '0 0 4px', lineHeight: '1.6' }}>
+                  <strong style={{ color: '#3b82f6' }}>1966案源</strong>：初評(1月)=AA01+新案額度 → AA02(2-6月) → AA01(7月) → AA02(8-12月) → 複評(13月)...
+                </p>
+                <p style={{ margin: '0 0 4px', lineHeight: '1.6' }}>
+                  <strong style={{ color: '#fbbf24' }}>出備階段</strong>：出院(1月)=AA01+新案額度 → AA02(2-4月) ｜ 獨立追蹤，以出院日起算
+                </p>
+                <p style={{ margin: '0 0 4px', lineHeight: '1.6' }}>
+                  <strong style={{ color: '#06b6d4' }}>初評後</strong>：初評(1月)=AA01（非新案，只開次月）→ 同1966週期 ｜ 以照專簽審日起算
+                </p>
+                <p style={{ margin: '0', lineHeight: '1.6', color: '#94a3b8' }}>
+                  💡 從照顧計畫匯入時，會自動識別複評服務月並正確計算後續 AA01/AA02 週期
+                </p>
+              </div>
+            </footer>
+          </div>
+
+          {/* 匯入 Modal */}
+          {showImportModal && (
+            <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '20px' }} onClick={() => { setShowImportModal(false); setImportPreview(null); }}>
+              <div style={{ background: 'linear-gradient(180deg, #1e293b 0%, #1e1b4b 100%)', borderRadius: '16px', padding: '24px', maxWidth: '500px', width: '100%', border: '1px solid rgba(255,255,255,0.1)', maxHeight: '80vh', overflowY: 'auto' }} onClick={e => e.stopPropagation()}>
+                <h3 style={{ fontSize: '18px', fontWeight: '600', marginBottom: '16px', color: '#e2e8f0' }}>從照顧計畫匯入</h3>
+                {importPreview && (
+                  <div>
+                    <p style={{ marginBottom: '12px', color: '#94a3b8' }}>
+                      讀取到 <strong style={{ color: '#e2e8f0' }}>{importPreview.total}</strong> 筆照顧計畫資料
+                    </p>
+                    
+                    {importPreview.toImport.length > 0 && (
+                      <div style={{ padding: '12px', background: 'rgba(34,197,94,0.1)', borderRadius: '8px', marginBottom: '12px' }}>
+                        <p style={{ color: '#4ade80', fontWeight: '500', marginBottom: '8px' }}>✓ 可匯入：{importPreview.toImport.length} 筆</p>
+                        <div style={{ fontSize: '12px', color: '#94a3b8', maxHeight: '150px', overflow: 'auto' }}>
+                          {importPreview.eligible.map((p, i) => {
+                            const converted = importPreview.toImport[i];
+                            const cycleBaseCount = (converted?.cycleBaseMonths || []).length;
+                            return (
+                              <div key={i} style={{ padding: '4px 0', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                <span>{p.caseName}</span>
+                                <span style={{ fontSize: '10px', padding: '1px 4px', borderRadius: '3px', background: p.sourceType === 'pac' ? 'rgba(6,182,212,0.2)' : 'rgba(59,130,246,0.2)', color: p.sourceType === 'pac' ? '#22d3ee' : '#60a5fa' }}>
+                                  {p.sourceType === 'pac' ? '出準' : '1966'}
+                                </span>
+                                {cycleBaseCount > 0 && (
+                                  <span style={{ fontSize: '10px', padding: '1px 4px', borderRadius: '3px', background: 'rgba(168,85,247,0.2)', color: '#c084fc' }}>
+                                    {cycleBaseCount}次複評
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                    
+                    {importPreview.duplicate.length > 0 && (
+                      <div style={{ padding: '12px', background: 'rgba(251,191,36,0.1)', borderRadius: '8px', marginBottom: '12px' }}>
+                        <p style={{ color: '#fbbf24', fontWeight: '500' }}>⚠ 已存在（跳過）：{importPreview.duplicate.length} 筆</p>
+                      </div>
+                    )}
+                    
+                    {importPreview.ineligible.length > 0 && (
+                      <div style={{ padding: '12px', background: 'rgba(239,68,68,0.1)', borderRadius: '8px', marginBottom: '12px' }}>
+                        <p style={{ color: '#f87171', fontWeight: '500' }}>✗ 不符合條件：{importPreview.ineligible.length} 筆</p>
+                        <div style={{ fontSize: '11px', color: '#94a3b8', marginTop: '4px' }}>
+                          {importPreview.ineligible.map((item, i) => (
+                            <div key={i}>{item.plan.caseName}：{item.reason}</div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    
+                    <div style={{ display: 'flex', gap: '12px', marginTop: '16px' }}>
+                      <button onClick={() => { setShowImportModal(false); setImportPreview(null); }} className="btn" style={{ flex: 1, padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.2)', background: 'transparent', color: '#94a3b8', fontSize: '14px' }}>取消</button>
+                      <button onClick={confirmImport} disabled={!importPreview.toImport.length} className="btn" style={{ flex: 1, padding: '12px', borderRadius: '8px', border: 'none', background: importPreview.toImport.length ? 'linear-gradient(135deg, #22c55e 0%, #16a34a 100%)' : 'rgba(255,255,255,0.1)', color: 'white', fontSize: '14px', fontWeight: '500', opacity: importPreview.toImport.length ? 1 : 0.5 }}>確認匯入</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<AATracker />);
+  </script>
+</body>
+</html>
