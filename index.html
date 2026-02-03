@@ -858,6 +858,9 @@
           quotaAllocations: c.quotaAllocations || [],
           completions: c.completions || [],
           isFirstCycle: c.isFirstCycle !== undefined ? c.isFirstCycle : true,
+          // 結案相關欄位
+          isClosed: c.isClosed || false,
+          closeDate: c.closeDate || '',
         };
         
         // 移除舊欄位名（避免混淆）
@@ -1002,6 +1005,7 @@
       
       const [searchText, setSearchText] = useState('');
       const [filterStatus, setFilterStatus] = useState('all');
+      const [filterCaseStatus, setFilterCaseStatus] = useState('active'); // 'all', 'active', 'closed'
 
       const [showImportModal, setShowImportModal] = useState(false);
       const [importPreview, setImportPreview] = useState(null);
@@ -1065,10 +1069,15 @@
 
         if (searchText) {
           const search = searchText.toLowerCase();
-          result = result.filter(c => 
-            c.caseName.toLowerCase().includes(search) || 
+          result = result.filter(c =>
+            c.caseName.toLowerCase().includes(search) ||
             (c.caseNumber && c.caseNumber.toLowerCase().includes(search))
           );
+        }
+
+        // 案件狀態篩選（在案中/已結案）
+        if (filterCaseStatus !== 'all') {
+          result = result.filter(c => filterCaseStatus === 'closed' ? c.isClosed : !c.isClosed);
         }
 
         if (filterStatus === 'pending') {
@@ -1089,24 +1098,30 @@
           if (tasks.some(t => t.type === 'AA02')) return 2;  // 有 AA02
           return 3;  // 僅額度
         };
-        
+
         result.sort((a, b) => {
+          // 結案的排最後
+          if (a.isClosed !== b.isClosed) return a.isClosed ? 1 : -1;
+
           const pa = getPriority(a);
           const pb = getPriority(b);
           if (pa !== pb) return pa - pb;
-          
+
           // 同優先級，按姓名排序
           return a.caseName.localeCompare(b.caseName, 'zh-TW');
         });
 
         return result;
-      }, [processedCases, searchText, filterStatus]);
+      }, [processedCases, searchText, filterCaseStatus, filterStatus]);
 
       // 總覽統計
       const overallStats = useMemo(() => {
         let totalPending = 0;
         let totalOverdue = 0;
         let totalCompleted = 0;
+
+        const closedCases = cases.filter(c => c.isClosed);
+        const activeCases = cases.filter(c => !c.isClosed);
 
         processedCases.forEach(c => {
           c.pendingTasks.forEach(t => {
@@ -1127,6 +1142,8 @@
           totalPending,
           totalOverdue,
           totalCompleted,
+          closedCount: closedCases.length,
+          activeCount: activeCases.length,
         };
       }, [cases, processedCases]);
 
@@ -1303,6 +1320,18 @@
       const handleDelete = (id) => {
         if (confirm('確定刪除此個案？')) {
           setCases(prev => prev.filter(c => c.id !== id));
+        }
+      };
+
+      const handleCloseCase = (id) => {
+        if (confirm('確定結案？')) {
+          setCases(prev => prev.map(c => c.id === id ? { ...c, isClosed: true, closeDate: getTaiwanDateString() } : c));
+        }
+      };
+
+      const handleReopenCase = (id) => {
+        if (confirm('確定取消結案？')) {
+          setCases(prev => prev.map(c => c.id === id ? { ...c, isClosed: false, closeDate: '' } : c));
         }
       };
 
@@ -1891,6 +1920,18 @@
                     </div>
                   </div>
                 </div>
+
+                {/* 第三列：案件狀態統計 */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '8px', marginTop: '8px' }}>
+                  <div style={{ textAlign: 'center', padding: '8px', background: 'rgba(34,197,94,0.1)', borderRadius: '6px', border: '1px solid rgba(34,197,94,0.2)' }}>
+                    <div style={{ fontSize: '16px', fontWeight: '600', color: '#22c55e' }}>{overallStats.activeCount}筆</div>
+                    <div style={{ fontSize: '10px', color: '#64748b' }}>在案中</div>
+                  </div>
+                  <div style={{ textAlign: 'center', padding: '8px', background: 'rgba(255,255,255,0.05)', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.08)' }}>
+                    <div style={{ fontSize: '16px', fontWeight: '600', color: '#64748b' }}>{overallStats.closedCount}筆</div>
+                    <div style={{ fontSize: '10px', color: '#64748b' }}>已結案</div>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -1904,6 +1945,15 @@
                   onChange={(e) => setSearchText(e.target.value)}
                   style={{ ...inputStyle, width: '150px' }}
                 />
+                <select
+                  value={filterCaseStatus}
+                  onChange={(e) => setFilterCaseStatus(e.target.value)}
+                  style={{ ...inputStyle, width: '90px' }}
+                >
+                  <option value="all">全部</option>
+                  <option value="active">在案中</option>
+                  <option value="closed">已結案</option>
+                </select>
                 <select
                   value={filterStatus}
                   onChange={(e) => setFilterStatus(e.target.value)}
@@ -1931,17 +1981,27 @@
               ) : filteredCases.map(caseData => {
                 const hasOverdue = caseData.pendingTasks.some(t => t.isOverdue);
                 const isPAC = caseData.sourceType === 'pac';
-                
+
                 // 顯示階段資訊
                 const hasDischarge = caseData.discharge?.startDate;
                 const hasMain = caseData.originStartDate;
                 const isDischargeOnly = hasDischarge && !hasMain;
 
+                // 結案樣式
+                const closedStyle = caseData.isClosed ? { opacity: 0.7 } : {};
+                const rowBg = caseData.isClosed
+                  ? 'rgba(100,116,139,0.08)'
+                  : hasOverdue ? 'rgba(239,68,68,0.08)' : 'rgba(255,255,255,0.03)';
+                const rowBorder = caseData.isClosed
+                  ? '1px solid rgba(100,116,139,0.2)'
+                  : hasOverdue ? '1px solid rgba(239,68,68,0.3)' : '1px solid rgba(255,255,255,0.08)';
+
                 return (
                   <div key={caseData.id} style={{
                     padding: '12px 14px', borderRadius: '10px',
-                    background: hasOverdue ? 'rgba(239,68,68,0.08)' : 'rgba(255,255,255,0.03)',
-                    border: hasOverdue ? '1px solid rgba(239,68,68,0.3)' : '1px solid rgba(255,255,255,0.08)',
+                    background: rowBg,
+                    border: rowBorder,
+                    ...closedStyle,
                   }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '10px' }}>
                       <div>
@@ -1965,6 +2025,7 @@
                               {caseData.cycleBaseMonths.length}次複評
                             </span>
                           )}
+                          {caseData.isClosed && <span style={{ fontSize: '8px', padding: '1px 4px', borderRadius: '3px', background: 'rgba(100,116,139,0.3)', color: '#94a3b8' }}>已結案</span>}
                         </div>
                         <div style={{ fontSize: '11px', color: '#64748b', marginTop: '2px' }}>
                           {isDischargeOnly ? (
@@ -1972,9 +2033,14 @@
                           ) : hasMain ? (
                             <>
                               第 {caseData.mainServiceMonth} 個服務月 · 起始 {formatDate(caseData.originStartDate)}
-                              {caseData.nextAA01 && (
+                              {!caseData.isClosed && caseData.nextAA01 && (
                                 <span style={{ marginLeft: '8px', color: '#a855f7' }}>
                                   · 下次AA01 {formatYearMonth(caseData.nextAA01.yearMonth)}
+                                </span>
+                              )}
+                              {caseData.isClosed && caseData.closeDate && (
+                                <span style={{ marginLeft: '8px', color: '#94a3b8' }}>
+                                  · 結案：{caseData.closeDate.replace(/-/g, '/')}
                                 </span>
                               )}
                             </>
@@ -1990,8 +2056,8 @@
                       }}>刪除</button>
                     </div>
 
-                    {/* 待辦任務 */}
-                    {caseData.pendingTasks.length > 0 && (
+                    {/* 待辦任務（結案後不顯示） */}
+                    {!caseData.isClosed && caseData.pendingTasks.length > 0 && (
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                         {caseData.pendingTasks.map((task, i) => (
                           <div key={i} style={{
@@ -2057,25 +2123,33 @@
                       </div>
                     )}
 
-                    {/* 無待辦時顯示最近完成 */}
-                    {caseData.pendingTasks.length === 0 && (
-                      <div style={{ fontSize: '11px', color: '#64748b' }}>
-                        ✓ 當月無待辦
-                        {/* 主階段最近完成 */}
-                        {caseData.originStartDate && (caseData.completions || []).slice(-2).reverse().map((comp, i) => (
-                          <span key={`main-${i}`} style={{ marginLeft: '8px' }}>
-                            <span style={{ color: comp.type === 'AA01' ? '#c084fc' : '#60a5fa' }}>{comp.type}</span>
-                            <span style={{ marginLeft: '4px' }}>{formatYearMonth(getYearMonth(caseData.originStartDate, comp.serviceMonth))}</span>
-                          </span>
-                        ))}
-                        {/* 出備階段最近完成 */}
-                        {caseData.discharge?.startDate && (caseData.discharge.completions || []).slice(-2).reverse().map((comp, i) => (
-                          <span key={`discharge-${i}`} style={{ marginLeft: '8px' }}>
-                            <span style={{ fontSize: '9px', color: '#fbbf24' }}>出備</span>
-                            <span style={{ color: comp.type === 'AA01' ? '#c084fc' : '#60a5fa', marginLeft: '4px' }}>{comp.type}</span>
-                            <span style={{ marginLeft: '4px' }}>{formatYearMonth(getYearMonth(caseData.discharge.startDate, comp.serviceMonth))}</span>
-                          </span>
-                        ))}
+                    {/* 無待辦時顯示最近完成（或已結案時顯示） */}
+                    {(caseData.pendingTasks.length === 0 || caseData.isClosed) && (
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <div style={{ fontSize: '11px', color: '#64748b' }}>
+                          ✓ 當月無待辦
+                          {/* 主階段最近完成 */}
+                          {caseData.originStartDate && (caseData.completions || []).slice(-2).reverse().map((comp, i) => (
+                            <span key={`main-${i}`} style={{ marginLeft: '8px' }}>
+                              <span style={{ color: comp.type === 'AA01' ? '#c084fc' : '#60a5fa' }}>{comp.type}</span>
+                              <span style={{ marginLeft: '4px' }}>{formatYearMonth(getYearMonth(caseData.originStartDate, comp.serviceMonth))}</span>
+                            </span>
+                          ))}
+                          {/* 出備階段最近完成 */}
+                          {caseData.discharge?.startDate && (caseData.discharge.completions || []).slice(-2).reverse().map((comp, i) => (
+                            <span key={`discharge-${i}`} style={{ marginLeft: '8px' }}>
+                              <span style={{ fontSize: '9px', color: '#fbbf24' }}>出備</span>
+                              <span style={{ color: comp.type === 'AA01' ? '#c084fc' : '#60a5fa', marginLeft: '4px' }}>{comp.type}</span>
+                              <span style={{ marginLeft: '4px' }}>{formatYearMonth(getYearMonth(caseData.discharge.startDate, comp.serviceMonth))}</span>
+                            </span>
+                          ))}
+                        </div>
+                        {/* 結案/取消結案按鈕 */}
+                        {!caseData.isClosed ? (
+                          <button onClick={() => handleCloseCase(caseData.id)} className="btn" style={{ padding: '3px 6px', borderRadius: '4px', border: '1px solid rgba(100,116,139,0.3)', background: 'transparent', color: '#94a3b8', fontSize: '9px' }}>結案</button>
+                        ) : (
+                          <button onClick={() => handleReopenCase(caseData.id)} className="btn" style={{ padding: '3px 6px', borderRadius: '4px', border: '1px solid rgba(34,197,94,0.3)', background: 'transparent', color: '#22c55e', fontSize: '9px' }}>取消結案</button>
+                        )}
                       </div>
                     )}
                   </div>
