@@ -2049,11 +2049,20 @@
                           )}
                         </div>
                       </div>
-                      <button onClick={() => handleDelete(caseData.id)} className="btn" style={{ 
-                        padding: '4px 8px', borderRadius: '4px', 
-                        border: '1px solid rgba(248,113,113,0.3)', 
-                        background: 'transparent', color: '#f87171', fontSize: '11px' 
-                      }}>刪除</button>
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        {/* 結案/取消結案按鈕 */}
+                        {!caseData.isClosed && caseData.pendingTasks.length === 0 && (
+                          <button onClick={() => handleCloseCase(caseData.id)} className="btn" style={{ padding: '4px 8px', borderRadius: '4px', border: '1px solid rgba(100,116,139,0.3)', background: 'transparent', color: '#94a3b8', fontSize: '11px' }}>結案</button>
+                        )}
+                        {caseData.isClosed && (
+                          <button onClick={() => handleReopenCase(caseData.id)} className="btn" style={{ padding: '4px 8px', borderRadius: '4px', border: '1px solid rgba(34,197,94,0.3)', background: 'transparent', color: '#22c55e', fontSize: '11px' }}>取消結案</button>
+                        )}
+                        <button onClick={() => handleDelete(caseData.id)} className="btn" style={{
+                          padding: '4px 8px', borderRadius: '4px',
+                          border: '1px solid rgba(248,113,113,0.3)',
+                          background: 'transparent', color: '#f87171', fontSize: '11px'
+                        }}>刪除</button>
+                      </div>
                     </div>
 
                     {/* 待辦任務（結案後不顯示） */}
@@ -2144,12 +2153,6 @@
                             </span>
                           ))}
                         </div>
-                        {/* 結案/取消結案按鈕 */}
-                        {!caseData.isClosed ? (
-                          <button onClick={() => handleCloseCase(caseData.id)} className="btn" style={{ padding: '3px 6px', borderRadius: '4px', border: '1px solid rgba(100,116,139,0.3)', background: 'transparent', color: '#94a3b8', fontSize: '9px' }}>結案</button>
-                        ) : (
-                          <button onClick={() => handleReopenCase(caseData.id)} className="btn" style={{ padding: '3px 6px', borderRadius: '4px', border: '1px solid rgba(34,197,94,0.3)', background: 'transparent', color: '#22c55e', fontSize: '9px' }}>取消結案</button>
-                        )}
                       </div>
                     )}
                   </div>
