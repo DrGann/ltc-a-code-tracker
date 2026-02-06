@@ -568,9 +568,9 @@
       const hasInitialRecord = history.some(h => h.type === 'initial');
       const isFirstCycle = !hasInitialRecord;
       
-      // 判斷出院準備的階段
+      // 判斷出院準備的階段（有 cmApprovalDate/cycleStartDate/originStartDate 任一者都不算出備）
       const isPAC = sourceType === 'pac';
-      const isDischargePhase = isPAC && !carePlan.cmApprovalDate && !carePlan.cycleStartDate;
+      const isDischargePhase = isPAC && !carePlan.cmApprovalDate && !carePlan.cycleStartDate && !carePlan.originStartDate;
       
       // 取得起算日：優先用 originStartDate（新版），fallback 到 cycleStartDate 或 cmApprovalDate
       const getMainStartDate = () => {
@@ -1361,11 +1361,13 @@
           plans.forEach(plan => {
             const isPAC = plan.sourceType === 'pac';
             const currentServiceMonth = plan.currentServiceMonth ?? 1;
-            // 出備階段：出院準備且沒有照專簽審日期
-            const isDischargePhase = isPAC && !plan.cmApprovalDate;
-            
-            // 出備階段需要出院日期，其他階段需要照專簽審日期
-            const hasStartDate = isDischargePhase ? plan.dischargeDate : plan.cmApprovalDate;
+            // 出備階段判斷：與 convertCarePlanToAACase 保持一致
+            const isDischargePhase = isPAC && !plan.cmApprovalDate && !plan.cycleStartDate && !plan.originStartDate;
+
+            // 出備階段需要出院日期，其他階段接受 originStartDate/cycleStartDate/cmApprovalDate
+            const hasStartDate = isDischargePhase
+              ? plan.dischargeDate
+              : (plan.originStartDate || plan.cycleStartDate || plan.cmApprovalDate);
 
             if (!hasStartDate) {
               preview.ineligible.push({
@@ -1394,6 +1396,11 @@
             if (converted) {
               preview.eligible.push(plan);
               preview.toImport.push(converted);
+            } else {
+              preview.ineligible.push({
+                plan,
+                reason: '資料不完整，無法轉換',
+              });
             }
           });
 
