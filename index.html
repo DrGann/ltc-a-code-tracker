@@ -616,19 +616,20 @@
         
         // 當前輪次處理
         if (carePlan.cmApprovalDate) {
-          // 優先使用 absoluteServiceMonth（新版），否則計算
+          // 優先使用 absoluteServiceMonth（新版），否則用 cmApprovalDate 計算
           let currentAbsoluteSM = carePlan.absoluteServiceMonth;
           if (!currentAbsoluteSM) {
-            currentAbsoluteSM = getCurrentServiceMonth(mainStartDate);
+            // 用 cmApprovalDate 計算絕對服務月，而非當前日期
+            currentAbsoluteSM = calculateAbsoluteServiceMonth(mainStartDate, carePlan.cmApprovalDate);
           }
-          
+
           // 檢查當前輪次是否已在 historyAA01Records 中
-          if (!historyAA01Records.some(r => r.serviceMonth === currentAbsoluteSM)) {
+          if (currentAbsoluteSM && !historyAA01Records.some(r => r.serviceMonth === currentAbsoluteSM)) {
             // 判斷當前輪次是否為 AA01 類型（初評/AA01/複評）
             const isAA01Type = carePlan.currentServiceMonth === 1 ||
               (carePlan.currentServiceMonth - 1) % 12 === 0 ||
               (carePlan.currentServiceMonth - 1) % 6 === 0;
-            
+
             if (isAA01Type) {
               historyAA01Records.push({
                 serviceMonth: currentAbsoluteSM,
@@ -737,18 +738,19 @@
 
       // 當前輪次處理
       if (carePlan.cmApprovalDate) {
-        // 優先使用 absoluteServiceMonth（新版），否則計算
+        // 優先使用 absoluteServiceMonth（新版），否則用 cmApprovalDate 計算
         let currentAbsoluteSM = carePlan.absoluteServiceMonth;
         if (!currentAbsoluteSM) {
-          currentAbsoluteSM = getCurrentServiceMonth(mainStartDate);
+          // 用 cmApprovalDate 計算絕對服務月，而非當前日期
+          currentAbsoluteSM = calculateAbsoluteServiceMonth(mainStartDate, carePlan.cmApprovalDate);
         }
-        
-        if (!historyAA01Records.some(r => r.serviceMonth === currentAbsoluteSM)) {
+
+        if (currentAbsoluteSM && !historyAA01Records.some(r => r.serviceMonth === currentAbsoluteSM)) {
           // 判斷當前輪次是否為 AA01 類型
           const isAA01Type = carePlan.currentServiceMonth === 1 ||
             (carePlan.currentServiceMonth - 1) % 12 === 0 ||
             (carePlan.currentServiceMonth - 1) % 6 === 0;
-          
+
           if (isAA01Type) {
             historyAA01Records.push({
               serviceMonth: currentAbsoluteSM,
@@ -761,7 +763,7 @@
           }
         }
       }
-      
+
       cycleBaseMonths.sort((a, b) => a - b);
       
       const { completions: mainCompletions, quotaAllocations: mainQuotas } = 
