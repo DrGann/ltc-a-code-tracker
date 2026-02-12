@@ -1606,13 +1606,17 @@
             }
             
             newCycleBaseMonths.sort((a, b) => a - b);
-            
-            // 比較是否有差異
+
+            // 比較是否有差異（即使新值為空也要更新，以清除錯誤的舊數據）
             const oldStr = JSON.stringify(updated.cycleBaseMonths || []);
             const newStr = JSON.stringify(newCycleBaseMonths);
-            if (oldStr !== newStr && newCycleBaseMonths.length > 0) {
+            if (oldStr !== newStr) {
               updated.cycleBaseMonths = newCycleBaseMonths;
-              caseFixes.push(`cycleBaseMonths(${newCycleBaseMonths.join(',')})`);
+              if (newCycleBaseMonths.length > 0) {
+                caseFixes.push(`cycleBaseMonths(${newCycleBaseMonths.join(',')})`);
+              } else if ((updated.cycleBaseMonths || []).length > 0 || oldStr !== '[]') {
+                caseFixes.push('cycleBaseMonths(清除錯誤數據)');
+              }
             }
             
             // 同步 originStartDate（如果子工具缺失但母工具有）
