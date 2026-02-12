@@ -604,10 +604,8 @@
                 type: 'AA01',
                 completedDate: completedDate,
               });
-              // 基準月刷新點：複評 或 提前的 AA01（非預期月份）
-              // 預期的 AA01 月份：服務月 1（初評）或 (serviceMonth - 1) % 6 === 0
-              const isExpectedAA01Month = absoluteSM === 1 || (absoluteSM - 1) % 6 === 0;
-              if (h.type === 'review' || (h.type === 'aa01' && !isExpectedAA01Month)) {
+              // 只有複評才會刷新週期基準
+              if (h.type === 'review') {
                 cycleBaseMonths.push(absoluteSM);
               }
             }
@@ -727,9 +725,8 @@
               type: 'AA01',
               completedDate: completedDate,
             });
-            // 基準月刷新點：複評 或 提前的 AA01（非預期月份）
-            const isExpectedAA01Month = absoluteSM === 1 || (absoluteSM - 1) % 6 === 0;
-            if (h.type === 'review' || (h.type === 'aa01' && !isExpectedAA01Month)) {
+            // 只有複評才會刷新週期基準
+            if (h.type === 'review') {
               cycleBaseMonths.push(absoluteSM);
             }
           }
