@@ -588,14 +588,10 @@
         
         history.forEach(h => {
           if (['initial', 'aa01', 'review'].includes(h.type)) {
-            // 優先使用 absoluteServiceMonth（新版格式），否則用日期計算（舊版兼容）
-            let absoluteSM = h.absoluteServiceMonth;
-            if (!absoluteSM) {
-              const actualDate = h.dates?.cmApprovalDate || h.completedDate;
-              if (actualDate) {
-                absoluteSM = calculateAbsoluteServiceMonth(mainStartDate, actualDate);
-              }
-            }
+            // 強制用日期重新計算 absoluteServiceMonth（不信任存儲的值，因為可能因提前完成而不準確）
+            // 優先使用 supervisorApprovalDate（週期計算的基準日期）
+            const dateForCalc = h.dates?.supervisorApprovalDate || h.dates?.cmApprovalDate || h.completedDate;
+            let absoluteSM = dateForCalc ? calculateAbsoluteServiceMonth(mainStartDate, dateForCalc) : h.absoluteServiceMonth;
 
             const completedDate = h.dates?.cmApprovalDate || h.completedDate;
             if (absoluteSM && completedDate) {
@@ -709,14 +705,10 @@
       
       history.forEach(h => {
         if (['initial', 'aa01', 'review'].includes(h.type)) {
-          // 優先使用 absoluteServiceMonth（新版格式），否則用日期計算（舊版兼容）
-          let absoluteSM = h.absoluteServiceMonth;
-          if (!absoluteSM) {
-            const actualDate = h.dates?.cmApprovalDate || h.completedDate;
-            if (actualDate) {
-              absoluteSM = calculateAbsoluteServiceMonth(mainStartDate, actualDate);
-            }
-          }
+          // 強制用日期重新計算 absoluteServiceMonth（不信任存儲的值，因為可能因提前完成而不準確）
+          // 優先使用 supervisorApprovalDate（週期計算的基準日期）
+          const dateForCalc = h.dates?.supervisorApprovalDate || h.dates?.cmApprovalDate || h.completedDate;
+          let absoluteSM = dateForCalc ? calculateAbsoluteServiceMonth(mainStartDate, dateForCalc) : h.absoluteServiceMonth;
 
           const completedDate = h.dates?.cmApprovalDate || h.completedDate;
           if (absoluteSM && completedDate) {
@@ -1578,28 +1570,25 @@
             const mainStartDate = matchedPlan.originStartDate || matchedPlan.cycleStartDate || matchedPlan.cmApprovalDate || updated.originStartDate;
             const newCycleBaseMonths = [];
             
-            // 從 history 提取複評的絕對服務月
+            // 從 history 提取複評的絕對服務月（強制用日期重算，不信任存儲值）
             history.forEach(h => {
               if (h.type === 'review') {
-                let absoluteSM = h.absoluteServiceMonth;
-                if (!absoluteSM && mainStartDate) {
-                  const dateForCalc = h.dates?.supervisorApprovalDate || h.dates?.cmApprovalDate || h.completedDate;
-                  if (dateForCalc) {
-                    absoluteSM = calculateAbsoluteServiceMonth(mainStartDate, dateForCalc);
-                  }
-                }
+                const dateForCalc = h.dates?.supervisorApprovalDate || h.dates?.cmApprovalDate || h.completedDate;
+                let absoluteSM = (dateForCalc && mainStartDate)
+                  ? calculateAbsoluteServiceMonth(mainStartDate, dateForCalc)
+                  : h.absoluteServiceMonth;
                 if (absoluteSM) {
                   newCycleBaseMonths.push(absoluteSM);
                 }
               }
             });
             
-            // 檢查當前輪次是否為複評
+            // 檢查當前輪次是否為複評（強制用日期重算）
             if (matchedPlan.currentServiceMonth > 1 && (matchedPlan.currentServiceMonth - 1) % 12 === 0) {
-              let currentAbsoluteSM = matchedPlan.absoluteServiceMonth;
-              if (!currentAbsoluteSM && mainStartDate && matchedPlan.cmApprovalDate) {
-                currentAbsoluteSM = calculateAbsoluteServiceMonth(mainStartDate, matchedPlan.cmApprovalDate);
-              }
+              const currentDateForCalc = matchedPlan.supervisorApprovalDate || matchedPlan.cmApprovalDate;
+              let currentAbsoluteSM = (currentDateForCalc && mainStartDate)
+                ? calculateAbsoluteServiceMonth(mainStartDate, currentDateForCalc)
+                : matchedPlan.absoluteServiceMonth;
               if (currentAbsoluteSM && !newCycleBaseMonths.includes(currentAbsoluteSM)) {
                 newCycleBaseMonths.push(currentAbsoluteSM);
               }
