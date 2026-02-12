@@ -596,7 +596,7 @@
                 absoluteSM = calculateAbsoluteServiceMonth(mainStartDate, actualDate);
               }
             }
-            
+
             const completedDate = h.dates?.cmApprovalDate || h.completedDate;
             if (absoluteSM && completedDate) {
               historyAA01Records.push({
@@ -604,8 +604,10 @@
                 type: 'AA01',
                 completedDate: completedDate,
               });
-              // 複評是基準月刷新點
-              if (h.type === 'review') {
+              // 基準月刷新點：複評 或 提前的 AA01（非預期月份）
+              // 預期的 AA01 月份：服務月 1（初評）或 (serviceMonth - 1) % 6 === 0
+              const isExpectedAA01Month = absoluteSM === 1 || (absoluteSM - 1) % 6 === 0;
+              if (h.type === 'review' || (h.type === 'aa01' && !isExpectedAA01Month)) {
                 cycleBaseMonths.push(absoluteSM);
               }
             }
@@ -716,7 +718,7 @@
               absoluteSM = calculateAbsoluteServiceMonth(mainStartDate, actualDate);
             }
           }
-          
+
           const completedDate = h.dates?.cmApprovalDate || h.completedDate;
           if (absoluteSM && completedDate) {
             historyAA01Records.push({
@@ -724,13 +726,15 @@
               type: 'AA01',
               completedDate: completedDate,
             });
-            if (h.type === 'review') {
+            // 基準月刷新點：複評 或 提前的 AA01（非預期月份）
+            const isExpectedAA01Month = absoluteSM === 1 || (absoluteSM - 1) % 6 === 0;
+            if (h.type === 'review' || (h.type === 'aa01' && !isExpectedAA01Month)) {
               cycleBaseMonths.push(absoluteSM);
             }
           }
         }
       });
-      
+
       // 當前輪次處理
       if (carePlan.cmApprovalDate) {
         // 優先使用 absoluteServiceMonth（新版），否則計算
